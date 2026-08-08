@@ -1,0 +1,14 @@
+[package]
+name = "strong-ipc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.189"
+smallvec = { version = "1.15.2", features = ["const_generics"] }
+tokio = { version = "1.53.1" }
+tokio-seqpacket = { version = "0.9.0", features = ["non-portable"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt", "time"] }
