@@ -4,11 +4,15 @@ use smallvec::SmallVec;
 use std::{
     ops::Deref,
     os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd},
+    path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::{
+    sync::mpsc::{self, error::TrySendError},
+    task::JoinSet,
+};
 use tokio_seqpacket::{
-    UCred, UnixSeqpacket,
+    UCred, UnixSeqpacket, UnixSeqpacketListener,
     ancillary::{AncillaryMessageWriter, OwnedAncillaryMessage},
     borrow_fd::BorrowFd,
 };
@@ -18,8 +22,8 @@ pub const MAX_FDS: usize = 253;
 pub const MAX_ANCILLARY_BUFFER_SIZE: usize = {
     // one block for the fds...
     (unsafe { libc::CMSG_SPACE((MAX_FDS * size_of::<RawFd>()) as u32) }
-    // ...plus one block for SCM_CREDENTIALS, since Node::task pulls both
-    // out of the same buffer
+    // ...plus one for SCM_CREDENTIALS, since recv_loop pulls both out of the
+    // same buffer
     + unsafe { libc::CMSG_SPACE(size_of::<libc::ucred>() as u32) }) as usize
 };
 
@@ -34,16 +38,15 @@ pub trait Handler: Send + Sync + 'static {
 
 pub type FdVec = SmallVec<[OwnedFd; MAX_FDS]>;
 
-/// A fd to be sent as ancillary data on a [`Message`].
+/// a fd to send as ancillary data on a [`Message`]
 ///
-/// `sendmsg`/`SCM_RIGHTS` only ever borrows the fd it sends — the kernel duplicates
-/// it into the receiver's fd table, the sender's fd is untouched — so this only needs
-/// to keep *something* alive that can yield a [`BorrowedFd`] at send time. No `dup` is
-/// ever required locally, whichever variant this is.
+/// `SCM_RIGHTS` only borrows the fd, the kernel dups it into the receiver's table and
+/// leaves yours alone, so this just has to keep something alive that can hand out a
+/// [`BorrowedFd`] at send time. never needs a local `dup` either way
 pub enum SendFd {
-    /// A fd owned outright, e.g. one forwarded from `Handler::handle`.
+    /// a fd owned outright, e.g. forwarded out of `Handler::handle`
     Owned(OwnedFd),
-    /// A clone of a [`Ref`]'s underlying socket, shared rather than duplicated.
+    /// a clone of a [`Ref`]'s socket, shared rather than duped
     Ref(Arc<UnixSeqpacket>),
 }
 impl AsFd for SendFd {
@@ -67,13 +70,13 @@ impl Message {
             fds: SmallVec::new(),
         }
     }
-    /// Embeds `r`'s socket so its fd is sent over the wire.
+    /// embeds `r`'s socket so its fd goes over the wire
     ///
-    /// `r` stays fully usable afterward, and can be embedded in any number of messages.
+    /// `r` stays usable after, and can go on as many messages as you want
     pub fn add_ref(&mut self, r: &Ref) {
         self.fds.push(SendFd::Ref(r.seqpacket.clone()));
     }
-    /// Embeds a raw received fd, e.g. to forward one from `Handler::handle`.
+    /// embeds a raw received fd, e.g. to forward one out of `Handler::handle`
     pub fn add_fd(&mut self, fd: OwnedFd) {
         self.fds.push(SendFd::Owned(fd));
     }
@@ -106,40 +109,121 @@ impl<H: Handler> Node<H> {
         seqpacket: UnixSeqpacket,
         ref_: Ref,
     ) -> std::io::Result<Self> {
-        let task = tokio::spawn(Self::task(handler.clone(), seqpacket));
+        let task = tokio::spawn(recv_loop(handler.clone(), seqpacket));
         Ok(Self {
             handler,
             ref_,
             _task: AbortOnDrop::new(task.abort_handle()),
         })
     }
-    /// A `Ref` pointing back at this node, kept alive as long as the node is.
+    /// a `Ref` pointing back at this node, alive as long as the node is
     pub fn get_ref(&self) -> &Ref {
         &self.ref_
     }
-    async fn task(handler: Arc<H>, seqpacket: UnixSeqpacket) -> std::io::Result<()> {
-        let mut buf = vec![0u8; 8192];
-        let mut ancillary_buf = vec![0u8; MAX_ANCILLARY_BUFFER_SIZE];
-        loop {
-            let (message_info, ancillary_messages) = seqpacket
-                .recv_with_ancillary(&mut buf, &mut ancillary_buf)
-                .await?;
-            if message_info.bytes_read() == 0 {
-                return Ok(());
-            }
-            let mut fd_buf = SmallVec::new();
-            let mut peer_cred: Option<UCred> = None;
-            for ancillary_data in ancillary_messages.into_messages() {
-                match ancillary_data {
-                    OwnedAncillaryMessage::FileDescriptors(fds) => fd_buf.extend(fds),
-                    OwnedAncillaryMessage::Credentials(mut creds) => {
-                        peer_cred = creds.next();
-                    }
-                    OwnedAncillaryMessage::Other(_) => (),
-                }
-            }
+}
 
-            handler.handle(buf.as_mut_slice(), fd_buf, peer_cred).await;
+/// the one spot where a message on the wire becomes a handler call
+///
+/// free-standing since node and boundnode share no type, they just both need something
+/// to feed a handler. `Ok` means the peer hung up, not an error, though that's just a
+/// zero-length read, same as an empty message, so sending one looks like a disconnect
+async fn recv_loop<H: Handler>(handler: Arc<H>, seqpacket: UnixSeqpacket) -> std::io::Result<()> {
+    let mut buf = vec![0u8; 8192];
+    let mut ancillary_buf = vec![0u8; MAX_ANCILLARY_BUFFER_SIZE];
+    loop {
+        let (message_info, ancillary_messages) = seqpacket
+            .recv_with_ancillary(&mut buf, &mut ancillary_buf)
+            .await?;
+        if message_info.bytes_read() == 0 {
+            return Ok(());
+        }
+        let mut fd_buf = SmallVec::new();
+        let mut peer_cred: Option<UCred> = None;
+        for ancillary_data in ancillary_messages.into_messages() {
+            match ancillary_data {
+                OwnedAncillaryMessage::FileDescriptors(fds) => fd_buf.extend(fds),
+                OwnedAncillaryMessage::Credentials(mut creds) => {
+                    peer_cred = creds.next();
+                }
+                OwnedAncillaryMessage::Other(_) => (),
+            }
+        }
+
+        handler
+            .handle(&mut buf[..message_info.bytes_read()], fd_buf, peer_cred)
+            .await;
+    }
+}
+
+/// a node listening on a path instead of a socketpair
+///
+/// caps have a bootstrap problem: if the only way to get a ref is someone handing you an
+/// fd, two unrelated processes can never meet. a path is the one name that isn't itself a
+/// capability, so it's the door you knock on before you have any
+///
+/// accepted conns only receive, no ref back out, peers pass one in-band with
+/// [`Message::add_ref`] if they want a reply. they all share the one handler and die
+/// with the boundnode
+pub struct BoundNode<H: Handler> {
+    handler: Arc<H>,
+    /// only set if we made the socket file, so we know whether it's ours to unlink
+    path: Option<PathBuf>,
+    _accept_task: AbortOnDrop,
+}
+impl<H: Handler> Deref for BoundNode<H> {
+    type Target = H;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handler
+    }
+}
+impl<H: Handler> BoundNode<H> {
+    /// binds a socket at `path`, unlinked again on drop
+    ///
+    /// won't clobber a path that already exists, a stale socket left by a crash fails
+    /// with `AddrInUse` instead, since replacing it could yank the path out from under
+    /// something still alive
+    pub fn bind<P: AsRef<Path>>(path: P, handler: H) -> std::io::Result<Self> {
+        Self::bind_raw(path, Arc::new(handler))
+    }
+    pub fn bind_raw<P: AsRef<Path>>(path: P, handler: Arc<H>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        let listener = UnixSeqpacketListener::bind(path)?;
+
+        let mut node = Self::from_listener(listener, handler)?;
+        node.path = Some(path.to_owned());
+        Ok(node)
+    }
+    /// takes over an already-bound listener, e.g. one handed to us by a service manager
+    ///
+    /// leaves the socket file alone on drop since it isn't ours to remove
+    pub fn from_listener(
+        listener: UnixSeqpacketListener,
+        handler: Arc<H>,
+    ) -> std::io::Result<Self> {
+        let task = tokio::spawn(Self::task(listener, handler.clone()));
+        Ok(Self {
+            handler,
+            path: None,
+            _accept_task: AbortOnDrop::new(task.abort_handle()),
+        })
+    }
+    async fn task(mut listener: UnixSeqpacketListener, handler: Arc<H>) -> std::io::Result<()> {
+        // lives in the task and not the boundnode so it needs no locking, killing this
+        // task drops the set, and every connection with it
+        let mut connections = JoinSet::new();
+        loop {
+            let seqpacket = listener.accept().await?;
+            // clear out whoever hung up since, so this doesn't grow forever
+            while connections.try_join_next().is_some() {}
+            connections.spawn(recv_loop(handler.clone(), seqpacket));
+        }
+    }
+}
+impl<H: Handler> Drop for BoundNode<H> {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -150,16 +234,22 @@ pub struct Ref {
     seqpacket: Arc<UnixSeqpacket>,
 }
 impl Ref {
+    /// connects to the [`BoundNode`] at `path`, giving you a ref that sends to it
+    ///
+    /// nothing comes back this way, if you want a reply, put a ref of your own on the
+    /// message with [`Message::add_ref`]
+    pub async fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        Self::from_seqpacket(UnixSeqpacket::connect(path).await?)
+    }
     pub fn from_owned_fd(fd: OwnedFd) -> std::io::Result<Self> {
         Self::from_seqpacket(UnixSeqpacket::try_from(fd)?)
     }
     pub fn from_seqpacket(seqpacket: UnixSeqpacket) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::channel(8);
         let seqpacket = Arc::new(seqpacket);
-        // Deliberately not tied to an AbortOnDrop: once the last `Ref` (and its
-        // `sender` clone) is dropped, `mpsc` closes the channel but still drains
-        // whatever's already queued before `recv()` returns `None`. Aborting here
-        // instead would race with in-flight `send_message` calls and drop them.
+        // deliberately not an AbortOnDrop: once the last `Ref` goes, mpsc closes the
+        // channel but still drains what's queued before `recv()` gives `None`. aborting
+        // would race with in-flight `send_message` calls and lose them
         tokio::spawn(Self::task(receiver, seqpacket.clone()));
         Ok(Self { sender, seqpacket })
     }

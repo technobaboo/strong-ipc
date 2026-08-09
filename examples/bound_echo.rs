@@ -1,0 +1,45 @@
+//! the `echo` example but over a bound socket
+//!
+//! both halves are in the one process here, so it doesn't really show the point of
+//! binding — see `bound_server`/`bound_client` for that
+
+use std::time::Duration;
+use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
+use tokio_util::sync::CancellationToken;
+
+pub struct EchoHandler;
+impl Handler for EchoHandler {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+        let return_fd = fds.into_iter().next().unwrap();
+        let return_ref = Ref::from_owned_fd(return_fd).unwrap();
+        return_ref
+            .send_message(Message::from_data(data.to_vec()))
+            .unwrap();
+    }
+}
+pub struct EchoReplyHandler(CancellationToken);
+impl Handler for EchoReplyHandler {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+        println!("Echo response: {}", String::from_utf8_lossy(data));
+        self.0.cancel();
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn main() {
+    let path = std::env::temp_dir().join(format!("strong-ipc-echo-{}.sock", std::process::id()));
+    let _echo_node = BoundNode::bind(&path, EchoHandler).unwrap();
+
+    let echo_ref = Ref::connect(&path).await.unwrap();
+
+    let finished_token = CancellationToken::new();
+    let reply_node = Node::new(EchoReplyHandler(finished_token.clone())).unwrap();
+
+    let mut message = Message::from_data("test".to_string().into_bytes());
+    message.add_ref(reply_node.get_ref());
+    echo_ref.send_message(message).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), finished_token.cancelled())
+        .await
+        .unwrap();
+}
