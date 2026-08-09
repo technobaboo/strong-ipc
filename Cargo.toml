@@ -11,4 +11,4 @@ tokio-seqpacket = { version = "0.9.0", features = ["non-portable"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["macros", "rt", "signal", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "signal", "time"] }

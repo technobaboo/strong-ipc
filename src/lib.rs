@@ -2,10 +2,14 @@
 
 use smallvec::SmallVec;
 use std::{
+    ffi::c_void,
     ops::Deref,
-    os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::{
     sync::mpsc::{self, error::TrySendError},
@@ -232,6 +236,72 @@ impl<H: Handler> Drop for BoundNode<H> {
 pub struct Ref {
     sender: mpsc::Sender<Message>,
     seqpacket: Arc<UnixSeqpacket>,
+    /// messages handed to the drain task that aren't on the wire yet
+    ///
+    /// gates the inline fast path in [`Ref::send_message`]: while anything is waiting,
+    /// a message that skipped the queue would overtake it, so everyone queues until the
+    /// backlog is gone. the task decrements only *after* its `sendmsg` returns, so the
+    /// message it is holding mid-send still counts
+    pending: Arc<AtomicUsize>,
+}
+
+/// one non-blocking `sendmsg`, straight to the kernel
+///
+/// no reactor, no task, no await — `MSG_DONTWAIT` means this either completes or fails,
+/// it never parks the caller. `message` is only borrowed, so a `WouldBlock` leaves it
+/// intact for the caller to queue instead
+fn try_send_now(seqpacket: &UnixSeqpacket, message: &Message) -> std::io::Result<()> {
+    // `AncillaryMessageWriter` realigns whatever buffer it is handed, and it hands back
+    // only a length, not the realigned slice — so align it up front and check that no
+    // bytes were skipped, otherwise the pointer below wouldn't match the length
+    #[repr(align(8))]
+    struct CmsgBuf([u8; MAX_ANCILLARY_BUFFER_SIZE]);
+    debug_assert_eq!(
+        align_of::<CmsgBuf>() % align_of::<libc::cmsghdr>(),
+        0,
+        "cmsg buffer is under-aligned for this target"
+    );
+    let mut cmsg = CmsgBuf([0; MAX_ANCILLARY_BUFFER_SIZE]);
+
+    let control_len = if message.fds.is_empty() {
+        0
+    } else {
+        let mut writer = AncillaryMessageWriter::new(&mut cmsg.0);
+        debug_assert_eq!(
+            writer.capacity(),
+            MAX_ANCILLARY_BUFFER_SIZE,
+            "buffer was realigned, so its start no longer matches the write pointer"
+        );
+        writer.add_fds(message.fds.iter().map(|f| f.borrow_fd()))?;
+        writer.len()
+    };
+
+    let mut iov = libc::iovec {
+        iov_base: message.data.as_ptr() as *mut c_void,
+        iov_len: message.data.len(),
+    };
+    // SAFETY: msghdr is a plain C struct with no invalid bit patterns, and every pointer
+    // written into it below outlives the sendmsg call
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &mut iov;
+    header.msg_iovlen = 1;
+    if control_len > 0 {
+        header.msg_control = cmsg.0.as_mut_ptr() as *mut c_void;
+        header.msg_controllen = control_len as _;
+    }
+
+    // MSG_NOSIGNAL so a dead peer surfaces as EPIPE instead of killing the process
+    let sent = unsafe {
+        libc::sendmsg(
+            seqpacket.as_fd().as_raw_fd(),
+            &header,
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 impl Ref {
     /// connects to the [`BoundNode`] at `path`, giving you a ref that sends to it
@@ -247,15 +317,21 @@ impl Ref {
     pub fn from_seqpacket(seqpacket: UnixSeqpacket) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::channel(8);
         let seqpacket = Arc::new(seqpacket);
+        let pending = Arc::new(AtomicUsize::new(0));
         // deliberately not an AbortOnDrop: once the last `Ref` goes, mpsc closes the
         // channel but still drains what's queued before `recv()` gives `None`. aborting
         // would race with in-flight `send_message` calls and lose them
-        tokio::spawn(Self::task(receiver, seqpacket.clone()));
-        Ok(Self { sender, seqpacket })
+        tokio::spawn(Self::task(receiver, seqpacket.clone(), pending.clone()));
+        Ok(Self {
+            sender,
+            seqpacket,
+            pending,
+        })
     }
     async fn task(
         mut message_rx: mpsc::Receiver<Message>,
         seqpacket: Arc<UnixSeqpacket>,
+        pending: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
         let mut ancillary_buffer = vec![0_u8; MAX_ANCILLARY_BUFFER_SIZE];
         loop {
@@ -268,12 +344,46 @@ impl Ref {
             // ancillary_message_writer.add_ucreds([UCred {}])
             // }
             ancillary_message_writer.add_fds(message.fds.iter().map(|f| f.borrow_fd()))?;
-            seqpacket
+            let result = seqpacket
                 .send_with_ancillary(&message.data, &mut ancillary_message_writer)
-                .await?;
+                .await;
+            // released only now, so the fast path stays shut until this really is on the
+            // wire. on error too — the message is gone either way, and leaving the count
+            // raised would wedge the fast path forever
+            pending.fetch_sub(1, Ordering::AcqRel);
+            result?;
         }
     }
+    /// hands `message` to the peer without ever blocking the caller
+    ///
+    /// tries the syscall inline first, so in the common case there is no channel, no
+    /// task wakeup and no scheduler hop. only a socket that is genuinely backed up falls
+    /// through to the queue, and only a full queue gives `Full` back
     pub fn send_message(&self, message: Message) -> Result<(), TrySendError<Message>> {
-        self.sender.try_send(message)
+        // a message with more fds than one `SCM_RIGHTS` can carry would fail the inline
+        // build; leave it to the task so oversized sends fail exactly as they used to
+        let inline_ok =
+            message.fds.len() <= MAX_FDS && self.pending.load(Ordering::Acquire) == 0;
+        if inline_ok {
+            match try_send_now(&self.seqpacket, &message) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // socket buffer is full, so fall through and let the task drain it
+                }
+                // the peer is gone or the socket is broken. a `Ref` that can't reach its
+                // node is as dead as a closed channel, so report it the same way
+                Err(_) => return Err(TrySendError::Closed(message)),
+            }
+        }
+        // claimed before the push so a concurrent fast path sees us coming and queues
+        // behind us instead of jumping the line
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        match self.sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                Err(e)
+            }
+        }
     }
 }
