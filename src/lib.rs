@@ -7,7 +7,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -51,14 +51,14 @@ pub type FdVec = SmallVec<[OwnedFd; MAX_FDS]>;
 pub enum SendFd {
     /// a fd owned outright, e.g. forwarded out of `Handler::handle`
     Owned(OwnedFd),
-    /// a clone of a [`Ref`]'s socket, shared rather than duped
-    Ref(Arc<UnixSeqpacket>),
+    /// a clone of a [`Ref`], shared rather than duped
+    Ref(Ref),
 }
 impl AsFd for SendFd {
     fn as_fd(&self) -> BorrowedFd<'_> {
         match self {
             SendFd::Owned(fd) => fd.as_fd(),
-            SendFd::Ref(seqpacket) => seqpacket.as_fd(),
+            SendFd::Ref(r) => r.inner.fd.as_fd(),
         }
     }
 }
@@ -79,7 +79,7 @@ impl Message {
     ///
     /// `r` stays usable after, and can go on as many messages as you want
     pub fn add_ref(&mut self, r: &Ref) {
-        self.fds.push(SendFd::Ref(r.seqpacket.clone()));
+        self.fds.push(SendFd::Ref(r.clone()));
     }
     /// embeds a raw received fd, e.g. to forward one out of `Handler::handle`
     pub fn add_fd(&mut self, fd: OwnedFd) {
@@ -233,10 +233,15 @@ impl<H: Handler> Drop for BoundNode<H> {
     }
 }
 
-#[derive(Clone)]
-pub struct Ref {
+/// everything a [`Ref`] needs only once its socket has actually backed up
+///
+/// building this is the expensive half of a `Ref`: a reactor registration (one
+/// `epoll_ctl`, and another when it drops), a channel, and a spawned task. none of it is
+/// touched while `sendmsg` keeps succeeding inline, and a `Ref` that is only ever sent to
+/// at a sane rate never builds it at all — which matters because a `Ref` is constructed
+/// for *every capability received*, so this used to be per-message cost
+struct SlowPath {
     sender: mpsc::Sender<Message>,
-    seqpacket: Arc<UnixSeqpacket>,
     /// messages handed to the drain task that aren't on the wire yet
     ///
     /// gates the inline fast path in [`Ref::send_message`]: while anything is waiting,
@@ -246,12 +251,58 @@ pub struct Ref {
     pending: Arc<AtomicUsize>,
 }
 
+struct RefInner {
+    /// the socket, deliberately *not* registered with the reactor — every inline send is
+    /// a bare `sendmsg` on this, which needs no readiness tracking at all
+    fd: OwnedFd,
+    /// captured at construction, since the slow path is built from `send_message`, which
+    /// is sync and may not be running on a runtime thread
+    runtime: Option<tokio::runtime::Handle>,
+    slow: OnceLock<SlowPath>,
+}
+
+impl RefInner {
+    fn slow_path(&self) -> std::io::Result<&SlowPath> {
+        if let Some(slow) = self.slow.get() {
+            return Ok(slow);
+        }
+        let built = self.build_slow_path()?;
+        // a concurrent caller may have got there first; theirs is as good as ours, so
+        // ours drops here — closing its channel, which retires the task it just spawned
+        let _ = self.slow.set(built);
+        Ok(self.slow.get().expect("just set, or set by whoever raced us"))
+    }
+
+    fn build_slow_path(&self) -> std::io::Result<SlowPath> {
+        // the drain task needs the socket *in* the reactor, so give it a dup and leave
+        // our own fd unregistered. both name the same open file description, so a send on
+        // either is a send on the same socket, and ordering between them still holds
+        let seqpacket = UnixSeqpacket::try_from(self.fd.try_clone()?)?;
+        let (sender, receiver) = mpsc::channel(8);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let runtime = self
+            .runtime
+            .clone()
+            .unwrap_or_else(tokio::runtime::Handle::current);
+        // deliberately not an AbortOnDrop: once the last `Ref` goes, mpsc closes the
+        // channel but still drains what's queued before `recv()` gives `None`. aborting
+        // would race with in-flight `send_message` calls and lose them
+        runtime.spawn(Ref::task(receiver, seqpacket, pending.clone()));
+        Ok(SlowPath { sender, pending })
+    }
+}
+
+#[derive(Clone)]
+pub struct Ref {
+    inner: Arc<RefInner>,
+}
+
 /// one non-blocking `sendmsg`, straight to the kernel
 ///
 /// no reactor, no task, no await — `MSG_DONTWAIT` means this either completes or fails,
 /// it never parks the caller. `message` is only borrowed, so a `WouldBlock` leaves it
 /// intact for the caller to queue instead
-fn try_send_now(seqpacket: &UnixSeqpacket, message: &Message) -> std::io::Result<()> {
+fn try_send_now(fd: BorrowedFd<'_>, message: &Message) -> std::io::Result<()> {
     // `AncillaryMessageWriter` realigns whatever buffer it is handed, and it hands back
     // only a length, not the realigned slice — so align it up front and check that no
     // bytes were skipped, otherwise the pointer below wouldn't match the length
@@ -294,7 +345,7 @@ fn try_send_now(seqpacket: &UnixSeqpacket, message: &Message) -> std::io::Result
     // MSG_NOSIGNAL so a dead peer surfaces as EPIPE instead of killing the process
     let sent = unsafe {
         libc::sendmsg(
-            seqpacket.as_fd().as_raw_fd(),
+            fd.as_raw_fd(),
             &header,
             libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
         )
@@ -312,26 +363,30 @@ impl Ref {
     pub async fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         Self::from_seqpacket(UnixSeqpacket::connect(path).await?)
     }
+    /// wraps an fd received over `SCM_RIGHTS`
+    ///
+    /// costs one allocation and nothing else — no reactor registration, no task. this is
+    /// the hot path: a node handling capabilities builds one of these per message
     pub fn from_owned_fd(fd: OwnedFd) -> std::io::Result<Self> {
-        Self::from_seqpacket(UnixSeqpacket::try_from(fd)?)
+        Ok(Self::from_fd(fd))
     }
     pub fn from_seqpacket(seqpacket: UnixSeqpacket) -> std::io::Result<Self> {
-        let (sender, receiver) = mpsc::channel(8);
-        let seqpacket = Arc::new(seqpacket);
-        let pending = Arc::new(AtomicUsize::new(0));
-        // deliberately not an AbortOnDrop: once the last `Ref` goes, mpsc closes the
-        // channel but still drains what's queued before `recv()` gives `None`. aborting
-        // would race with in-flight `send_message` calls and lose them
-        tokio::spawn(Self::task(receiver, seqpacket.clone(), pending.clone()));
-        Ok(Self {
-            sender,
-            seqpacket,
-            pending,
-        })
+        // hand back the reactor registration the socket arrived with; if this ref ever
+        // backs up, the slow path registers a dup of its own
+        Ok(Self::from_fd(OwnedFd::from(seqpacket)))
+    }
+    fn from_fd(fd: OwnedFd) -> Self {
+        Self {
+            inner: Arc::new(RefInner {
+                fd,
+                runtime: tokio::runtime::Handle::try_current().ok(),
+                slow: OnceLock::new(),
+            }),
+        }
     }
     async fn task(
         mut message_rx: mpsc::Receiver<Message>,
-        seqpacket: Arc<UnixSeqpacket>,
+        seqpacket: UnixSeqpacket,
         pending: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
         let mut ancillary_buffer = vec![0_u8; EXPECTED_ANCILLARY_BUFFER_SIZE];
@@ -361,11 +416,18 @@ impl Ref {
     /// task wakeup and no scheduler hop. only a socket that is genuinely backed up falls
     /// through to the queue, and only a full queue gives `Full` back
     pub fn send_message(&self, message: Message) -> Result<(), TrySendError<Message>> {
+        // a backlog can only exist if something already built the slow path, so an
+        // untouched ref answers this with one relaxed load and no indirection
+        let backed_up = self
+            .inner
+            .slow
+            .get()
+            .is_some_and(|slow| slow.pending.load(Ordering::Acquire) != 0);
         // a message with more fds than one `SCM_RIGHTS` can carry would fail the inline
         // build; leave it to the task so oversized sends fail exactly as they used to
-        let inline_ok = message.fds.len() <= MAX_FDS && self.pending.load(Ordering::Acquire) == 0;
+        let inline_ok = message.fds.len() <= MAX_FDS && !backed_up;
         if inline_ok {
-            match try_send_now(&self.seqpacket, &message) {
+            match try_send_now(self.inner.fd.as_fd(), &message) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // socket buffer is full, so fall through and let the task drain it
@@ -375,13 +437,17 @@ impl Ref {
                 Err(_) => return Err(TrySendError::Closed(message)),
             }
         }
+        // first time we've needed the queue on this ref, so pay for it now
+        let Ok(slow) = self.inner.slow_path() else {
+            return Err(TrySendError::Closed(message));
+        };
         // claimed before the push so a concurrent fast path sees us coming and queues
         // behind us instead of jumping the line
-        self.pending.fetch_add(1, Ordering::AcqRel);
-        match self.sender.try_send(message) {
+        slow.pending.fetch_add(1, Ordering::AcqRel);
+        match slow.sender.try_send(message) {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.pending.fetch_sub(1, Ordering::AcqRel);
+                slow.pending.fetch_sub(1, Ordering::AcqRel);
                 Err(e)
             }
         }

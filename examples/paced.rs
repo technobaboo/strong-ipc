@@ -15,6 +15,7 @@
 //!   - `--caps N`      capabilities attached to each message
 //!   - `--sequential`  await each reply before sending the next, instead of pipelining
 //!   - `--busy-wait`   spin to the next deadline instead of sleeping
+//!   - `--dump PATH`   write every raw sample as `kind,ns` for offline histograms
 //!
 //! `--busy-wait` is the control. same pacing, same message count, but the client never
 //! parks — so the gap between a normal run and a `--busy-wait` run is the price of going
@@ -287,6 +288,7 @@ fn main() {
         println!("  --sequential    await each reply before sending the next");
         println!("  --busy-wait     spin to the next deadline instead of sleeping");
         println!("  --raw           bare seqpacket floor, no strong-ipc (ignores --caps)");
+        println!("  --dump PATH     write raw `kind,ns` samples for offline histograms");
         return;
     }
 
@@ -524,6 +526,30 @@ async fn parent_main(args: Vec<String>) {
     let elapsed = wall.elapsed().as_secs_f64();
     let client_cpu = cpu_seconds(self_pid).unwrap_or(0.0) - cpu0_client;
     let server_cpu = cpu_seconds(child_pid).unwrap_or(0.0) - cpu0_server;
+
+    // raw samples before `summarize` eats the vectors, so percentiles aren't the only
+    // thing that survives a run — the shape of the distribution is the interesting part
+    if let Some(i) = args.iter().position(|a| a == "--dump") {
+        if let Some(path) = args.get(i + 1) {
+            let mut out = String::from("kind,ns\n");
+            for (kind, samples) in [
+                ("msg", &msg_ns),
+                ("burst", &burst_ns),
+                ("wake", &wake_ns),
+            ] {
+                for ns in samples.iter() {
+                    out.push_str(kind);
+                    out.push(',');
+                    out.push_str(&ns.to_string());
+                    out.push('\n');
+                }
+            }
+            match std::fs::write(path, out) {
+                Ok(()) => println!("  samples             written to {path}"),
+                Err(e) => eprintln!("  could not write {path}: {e}"),
+            }
+        }
+    }
 
     if msg_ns.is_empty() {
         println!("\nno replies came back — nothing to report");
