@@ -23,9 +23,10 @@ use tokio_seqpacket::{
 use tokio_util::task::AbortOnDrop;
 
 pub const MAX_FDS: usize = 253;
-pub const MAX_ANCILLARY_BUFFER_SIZE: usize = {
+pub const EXPECTED_FDS: usize = 8;
+pub const EXPECTED_ANCILLARY_BUFFER_SIZE: usize = {
     // one block for the fds...
-    (unsafe { libc::CMSG_SPACE((MAX_FDS * size_of::<RawFd>()) as u32) }
+    (unsafe { libc::CMSG_SPACE((EXPECTED_FDS * size_of::<RawFd>()) as u32) }
     // ...plus one for SCM_CREDENTIALS, since recv_loop pulls both out of the
     // same buffer
     + unsafe { libc::CMSG_SPACE(size_of::<libc::ucred>() as u32) }) as usize
@@ -133,7 +134,7 @@ impl<H: Handler> Node<H> {
 /// zero-length read, same as an empty message, so sending one looks like a disconnect
 async fn recv_loop<H: Handler>(handler: Arc<H>, seqpacket: UnixSeqpacket) -> std::io::Result<()> {
     let mut buf = vec![0u8; 8192];
-    let mut ancillary_buf = vec![0u8; MAX_ANCILLARY_BUFFER_SIZE];
+    let mut ancillary_buf = vec![0u8; EXPECTED_ANCILLARY_BUFFER_SIZE];
     loop {
         let (message_info, ancillary_messages) = seqpacket
             .recv_with_ancillary(&mut buf, &mut ancillary_buf)
@@ -255,13 +256,13 @@ fn try_send_now(seqpacket: &UnixSeqpacket, message: &Message) -> std::io::Result
     // only a length, not the realigned slice — so align it up front and check that no
     // bytes were skipped, otherwise the pointer below wouldn't match the length
     #[repr(align(8))]
-    struct CmsgBuf([u8; MAX_ANCILLARY_BUFFER_SIZE]);
+    struct CmsgBuf([u8; EXPECTED_ANCILLARY_BUFFER_SIZE]);
     debug_assert_eq!(
         align_of::<CmsgBuf>() % align_of::<libc::cmsghdr>(),
         0,
         "cmsg buffer is under-aligned for this target"
     );
-    let mut cmsg = CmsgBuf([0; MAX_ANCILLARY_BUFFER_SIZE]);
+    let mut cmsg = CmsgBuf([0; EXPECTED_ANCILLARY_BUFFER_SIZE]);
 
     let control_len = if message.fds.is_empty() {
         0
@@ -269,7 +270,7 @@ fn try_send_now(seqpacket: &UnixSeqpacket, message: &Message) -> std::io::Result
         let mut writer = AncillaryMessageWriter::new(&mut cmsg.0);
         debug_assert_eq!(
             writer.capacity(),
-            MAX_ANCILLARY_BUFFER_SIZE,
+            EXPECTED_ANCILLARY_BUFFER_SIZE,
             "buffer was realigned, so its start no longer matches the write pointer"
         );
         writer.add_fds(message.fds.iter().map(|f| f.borrow_fd()))?;
@@ -333,7 +334,7 @@ impl Ref {
         seqpacket: Arc<UnixSeqpacket>,
         pending: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
-        let mut ancillary_buffer = vec![0_u8; MAX_ANCILLARY_BUFFER_SIZE];
+        let mut ancillary_buffer = vec![0_u8; EXPECTED_ANCILLARY_BUFFER_SIZE];
         loop {
             let Some(message) = message_rx.recv().await else {
                 return Ok(());
@@ -362,8 +363,7 @@ impl Ref {
     pub fn send_message(&self, message: Message) -> Result<(), TrySendError<Message>> {
         // a message with more fds than one `SCM_RIGHTS` can carry would fail the inline
         // build; leave it to the task so oversized sends fail exactly as they used to
-        let inline_ok =
-            message.fds.len() <= MAX_FDS && self.pending.load(Ordering::Acquire) == 0;
+        let inline_ok = message.fds.len() <= MAX_FDS && self.pending.load(Ordering::Acquire) == 0;
         if inline_ok {
             match try_send_now(&self.seqpacket, &message) {
                 Ok(()) => return Ok(()),

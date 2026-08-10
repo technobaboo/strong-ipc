@@ -234,8 +234,7 @@ impl Handler for EchoHandler {
             );
             std::process::exit(0);
         }
-        self.fds_seen
-            .fetch_add(fds.len() as u64, Ordering::Relaxed);
+        self.fds_seen.fetch_add(fds.len() as u64, Ordering::Relaxed);
         let op = data.first().copied().unwrap_or(OP_DROP_FD);
         let mut fds = fds.into_iter();
 
@@ -303,7 +302,7 @@ async fn server_main(path: PathBuf) {
             };
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
-                let mut anc = vec![0u8; strong_ipc::MAX_ANCILLARY_BUFFER_SIZE];
+                let mut anc = vec![0u8; strong_ipc::EXPECTED_ANCILLARY_BUFFER_SIZE];
                 loop {
                     let Ok((info, msgs)) = sock.recv_with_ancillary(&mut buf, &mut anc).await
                     else {
@@ -344,23 +343,22 @@ async fn rung_tokio_raw(
     use tokio_seqpacket::ancillary::AncillaryMessageWriter;
     let data = vec![0x41u8; payload];
     let mut buf = vec![0u8; 65536];
-    let mut anc = vec![0u8; strong_ipc::MAX_ANCILLARY_BUFFER_SIZE];
+    let mut anc = vec![0u8; strong_ipc::EXPECTED_ANCILLARY_BUFFER_SIZE];
 
-    let once = async |sock: &tokio_seqpacket::UnixSeqpacket,
-                      buf: &mut Vec<u8>,
-                      anc: &mut Vec<u8>| {
-        if with_fd {
-            let mut w = AncillaryMessageWriter::new(anc);
-            let borrowed = [spare.as_fd()];
-            w.add_fds(&borrowed).unwrap();
-            sock.send_vectored_with_ancillary(&[std::io::IoSlice::new(&data)], &mut w)
-                .await
-                .unwrap();
-        } else {
-            sock.send(&data).await.unwrap();
-        }
-        sock.recv(buf).await.unwrap();
-    };
+    let once =
+        async |sock: &tokio_seqpacket::UnixSeqpacket, buf: &mut Vec<u8>, anc: &mut Vec<u8>| {
+            if with_fd {
+                let mut w = AncillaryMessageWriter::new(anc);
+                let borrowed = [spare.as_fd()];
+                w.add_fds(&borrowed).unwrap();
+                sock.send_vectored_with_ancillary(&[std::io::IoSlice::new(&data)], &mut w)
+                    .await
+                    .unwrap();
+            } else {
+                sock.send(&data).await.unwrap();
+            }
+            sock.recv(buf).await.unwrap();
+        };
 
     for _ in 0..WARMUP {
         once(sock, &mut buf, &mut anc).await;
@@ -434,9 +432,7 @@ fn main() {
     }
 
     println!("strong-ipc round-trip cost decomposition");
-    println!(
-        "  {ITERS} timed iterations per row after {WARMUP} warmup, release build, all µs"
-    );
+    println!("  {ITERS} timed iterations per row after {WARMUP} warmup, release build, all µs");
 
     // rung 1 runs before any runtime exists, so fork() only ever copies one thread
     header("rung 1 — raw blocking sendmsg/recvmsg, no tokio, no library");
@@ -452,7 +448,16 @@ fn main() {
         kernel_fd_cost.push(b.p50 - a.p50);
         println!(
             "  {:>8}  {:>8.2} {:>8.2} {:>8.2} {:>8.2}   {:>8.2} {:>8.2} {:>8.2} {:>8.2}   {:>+8.2}",
-            payload, a.p50, a.p90, a.p99, a.mean, b.p50, b.p90, b.p99, b.mean, b.p50 - a.p50
+            payload,
+            a.p50,
+            a.p90,
+            a.p99,
+            a.mean,
+            b.p50,
+            b.p90,
+            b.p99,
+            b.mean,
+            b.p50 - a.p50
         );
     }
 
@@ -509,7 +514,16 @@ async fn async_main(_args: Vec<String>, kernel_fd_cost: Vec<f64>) {
         let b = rung_tokio_raw(&raw_sock, &spare, payload, true).await;
         println!(
             "  {:>8}  {:>8.2} {:>8.2} {:>8.2} {:>8.2}   {:>8.2} {:>8.2} {:>8.2} {:>8.2}   {:>+8.2}",
-            payload, a.p50, a.p90, a.p99, a.mean, b.p50, b.p90, b.p99, b.mean, b.p50 - a.p50
+            payload,
+            a.p50,
+            a.p90,
+            a.p99,
+            a.mean,
+            b.p50,
+            b.p90,
+            b.p99,
+            b.mean,
+            b.p50 - a.p50
         );
     }
 
@@ -552,19 +566,37 @@ async fn async_main(_args: Vec<String>, kernel_fd_cost: Vec<f64>) {
     {
         let k0 = rung_raw_syscall(8, false).0.p50;
         let t0 = rung_tokio_raw(&raw_sock, &spare, 8, false).await.p50;
-        let s_none =
-            rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_DROP_FD, false).await.p50;
-        let s_drop =
-            rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_DROP_FD, true).await.p50;
-        let s_ref =
-            rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_MAKE_REF, true).await.p50;
+        let s_none = rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_DROP_FD, false)
+            .await
+            .p50;
+        let s_drop = rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_DROP_FD, true)
+            .await
+            .p50;
+        let s_ref = rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_MAKE_REF, true)
+            .await
+            .p50;
         println!("  kernel round trip, no fd                {k0:>7.2} µs");
-        println!("  + tokio reactor                         {:>+7.2} µs   → {t0:.2}", t0 - k0);
-        println!("  + strong-ipc Ref queue and handler      {:>+7.2} µs   → {s_none:.2}", s_none - t0);
-        println!("  + one SCM_RIGHTS descriptor             {:>+7.2} µs   → {s_drop:.2}", s_drop - s_none);
-        println!("  + Ref::from_owned_fd on the receiver    {:>+7.2} µs   → {s_ref:.2}", s_ref - s_drop);
+        println!(
+            "  + tokio reactor                         {:>+7.2} µs   → {t0:.2}",
+            t0 - k0
+        );
+        println!(
+            "  + strong-ipc Ref queue and handler      {:>+7.2} µs   → {s_none:.2}",
+            s_none - t0
+        );
+        println!(
+            "  + one SCM_RIGHTS descriptor             {:>+7.2} µs   → {s_drop:.2}",
+            s_drop - s_none
+        );
+        println!(
+            "  + Ref::from_owned_fd on the receiver    {:>+7.2} µs   → {s_ref:.2}",
+            s_ref - s_drop
+        );
         println!();
-        println!("  kernel's own charge for the descriptor  {:>7.2} µs (rung 1, 8 B)", kernel_fd_cost[0]);
+        println!(
+            "  kernel's own charge for the descriptor  {:>7.2} µs (rung 1, 8 B)",
+            kernel_fd_cost[0]
+        );
     }
 
     let _ = server.send_message(Message::from_data(b"QUIT".to_vec()));
