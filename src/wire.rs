@@ -71,6 +71,94 @@ pub(crate) const MAX_ANCILLARY_BUFFER_SIZE: usize =
 /// reported as `EMSGSIZE`), so raising this past that will not work.
 pub const MAX_MESSAGE_SIZE: usize = 8192;
 
+/// `RLIM_INFINITY` is `None` on the way in and [`usize::MAX`] on the way out — there is no
+/// number to report for "no limit", and the largest `usize` is the closest true thing
+fn as_count(value: Option<u64>) -> usize {
+    value.map_or(usize::MAX, |v| v.try_into().unwrap_or(usize::MAX))
+}
+
+/// the inverse: [`usize::MAX`] asks for `RLIM_INFINITY`, which only a process that may
+/// raise its hard limit will actually get
+fn as_rlim(count: usize) -> Option<u64> {
+    (count != usize::MAX).then(|| u64::try_from(count).unwrap_or(u64::MAX))
+}
+
+/// this process's current open-descriptor limit — the soft `RLIMIT_NOFILE`
+///
+/// the soft limit is the one that bites: it is what the kernel checks, and what returns
+/// `EMFILE`. See [`maximize_fd_limit`] for why that matters more here than in most crates.
+///
+/// the `Result` is for symmetry with the other two, and against the day this needs a
+/// syscall that can fail; today reading the limit cannot.
+pub fn fd_limit() -> std::io::Result<usize> {
+    Ok(as_count(
+        rustix::process::getrlimit(rustix::process::Resource::Nofile).current,
+    ))
+}
+
+/// sets this process's open-descriptor limit to exactly `limit`
+///
+/// only the soft limit moves. Asking for more than the hard limit fails (`EPERM`, or
+/// `EINVAL` past the kernel's own `nr_open`) rather than being clamped to it — a silent
+/// clamp would hand back a process that quietly holds fewer capabilities than it was told
+/// to. [`maximize_fd_limit`] is the version that wants the ceiling without naming it.
+///
+/// lowering is allowed and is not undoable in general: a process that drops its soft limit
+/// can raise it again, but only up to the hard limit it still has.
+///
+/// returns the new soft limit, which on success is `limit`.
+pub fn set_fd_limit(limit: usize) -> std::io::Result<usize> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let current = as_rlim(limit);
+    // the hard limit is preserved rather than passed through as `None`: on Linux `None`
+    // means infinity, so echoing it back would be a request to *raise* the ceiling
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current,
+            maximum: getrlimit(Resource::Nofile).maximum,
+        },
+    )?;
+
+    Ok(as_count(current))
+}
+
+/// raises this process's open-descriptor limit to its hard ceiling, returning the new soft
+/// limit
+///
+/// a capability is a descriptor, so in this crate the descriptor limit *is* the ceiling on
+/// how many things you can hold the authority to talk to. The default soft limit is often
+/// 1024 while the hard limit is orders of magnitude higher, and nothing but the soft limit
+/// stands between the two — raising it needs no privilege, only the asking.
+///
+/// this is the entire reason it is public: `EMFILE` on a `recvmsg` carrying `SCM_RIGHTS`
+/// means the kernel dropped capabilities that were already in flight, which is a far worse
+/// failure than being told up front that you cannot have them.
+///
+/// the hard limit is left alone — lowering it is irreversible, and raising it is what
+/// actually needs privilege. When the soft limit is already at the ceiling this changes
+/// nothing and just reports it. An unlimited (`RLIM_INFINITY`) limit is reported as
+/// [`usize::MAX`], since there is no number to give.
+pub fn maximize_fd_limit() -> std::io::Result<usize> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    // None is RLIM_INFINITY on both fields: no ceiling to raise to, nothing to raise
+    let limit = getrlimit(Resource::Nofile);
+
+    if limit.current != limit.maximum {
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: limit.maximum,
+                maximum: limit.maximum,
+            },
+        )?;
+    }
+
+    Ok(as_count(limit.maximum))
+}
+
 fn flags_for_send() -> SendFlags {
     // DONTWAIT so this never parks the caller; NOSIGNAL so a dead peer surfaces as EPIPE
     // instead of killing the process; EOR to mark the record boundary, which is what

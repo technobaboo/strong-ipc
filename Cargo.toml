@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 # `event` is only for the zero-timeout `ppoll` behind `Ref::is_dead` — asking the kernel
-# whether a socket's peer is gone without registering it with the reactor
-rustix = { version = "1.1.4", features = ["net", "event"] }
+# whether a socket's peer is gone without registering it with the reactor; `process` is
+# only for the rlimit pair behind `maximize_fd_limit`
+rustix = { version = "1.1.4", features = ["net", "event", "process"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
 # `net` is what provides tokio::io::unix::AsyncFd, which the outbox and the receive
 # loop use to wait on socket readiness; `sync` is the mpsc behind the outbox and the

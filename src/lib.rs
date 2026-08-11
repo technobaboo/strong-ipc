@@ -87,7 +87,10 @@ pub use capability::Ref;
 pub use error::{SendError, TrySendError};
 pub use message::{FdVec, Message};
 pub use node::{BoundNode, Handler, Node};
-pub use wire::{EXPECTED_ANCILLARY_BUFFER_SIZE, MAX_FDS, MAX_MESSAGE_SIZE};
+pub use wire::{
+    EXPECTED_ANCILLARY_BUFFER_SIZE, MAX_FDS, MAX_MESSAGE_SIZE, fd_limit, maximize_fd_limit,
+    set_fd_limit,
+};
 
 /// the peer's credentials, as reported by `SCM_CREDENTIALS`
 ///
