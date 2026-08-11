@@ -200,6 +200,29 @@ pub(crate) fn recv_now(
     })
 }
 
+/// the true length of the next queued datagram, without consuming it
+///
+/// `MSG_PEEK` leaves the message in the queue and `MSG_TRUNC` makes the return value the
+/// datagram's real length rather than however much was copied — so with no iovec at all
+/// this is a pure "how big is the next one?" query.
+///
+/// the control buffer is deliberately zero-length. Peeking a message that carries
+/// `SCM_RIGHTS` into a *real* control buffer would have the kernel install those
+/// descriptors into us, and because the message stays queued the following `recvmsg`
+/// installs them a second time — a descriptor leak on every message. With nowhere to put
+/// them the kernel just flags `MSG_CTRUNC` and leaves them attached to the queued message
+pub(crate) fn peek_len(fd: BorrowedFd<'_>) -> std::io::Result<usize> {
+    let mut no_data: [IoSliceMut<'_>; 0] = [];
+    let mut no_control = RecvAncillaryBuffer::new(&mut []);
+    let msg = net::recvmsg(
+        fd,
+        &mut no_data,
+        &mut no_control,
+        RecvFlags::PEEK | RecvFlags::TRUNC,
+    )?;
+    Ok(msg.bytes)
+}
+
 /// accepts one pending connection, non-blocking
 pub(crate) fn accept_now(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
     Ok(net::accept_with(
@@ -264,14 +287,39 @@ impl Reactive {
         }
     }
 
-    pub(crate) async fn recv(
+    /// receives the next message, growing `buf` first if it would not fit
+    ///
+    /// peeks the datagram's length before consuming it, so an oversized message is never
+    /// destroyed by a buffer too small to hold it. That costs a second syscall on every
+    /// receive, which is the price of never losing a message — see the note on
+    /// [`peek_len`] for why the peek must carry no control buffer.
+    ///
+    /// the peek is skipped once `buf` has reached `ceiling`: a datagram cannot exceed the
+    /// socket's own receive buffer, so at that point truncation is impossible and there
+    /// is nothing left to ask about
+    pub(crate) async fn recv_growing(
         &self,
-        buf: &mut [u8],
+        buf: &mut Vec<u8>,
         control_space: &mut [MaybeUninit<u8>],
+        ceiling: usize,
     ) -> std::io::Result<Received> {
         loop {
             let mut guard = self.io.readable().await?;
-            match guard.try_io(|inner| recv_now(inner.get_ref().as_fd(), buf, control_space)) {
+            let buf = &mut *buf;
+            let control_space = &mut *control_space;
+            // both syscalls happen under one readiness guard, so a peek that finds the
+            // socket empty retries the whole thing rather than desynchronising the two
+            let attempt = guard.try_io(|inner| {
+                let fd = inner.get_ref().as_fd();
+                if buf.len() < ceiling {
+                    let len = peek_len(fd)?;
+                    if len > buf.len() {
+                        buf.resize(len.min(ceiling), 0);
+                    }
+                }
+                recv_now(fd, buf, control_space)
+            });
+            match attempt {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }

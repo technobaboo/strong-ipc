@@ -73,6 +73,13 @@ async fn descriptors_above_the_inline_buffer() {
 /// every received capability is duped into the receiving process by the kernel, so a
 /// handler that fails to drop them exhausts the descriptor table. this is the cheap
 /// always-on version of the `descriptor churn` phase in `examples/bench.rs`.
+///
+/// it is also the guard on a specific hazard in the receive path: `recv_loop` peeks each
+/// datagram's length before consuming it, and a peek that carried a real control buffer
+/// would have the kernel install the message's `SCM_RIGHTS` descriptors *and* leave the
+/// message queued, so the following `recvmsg` would install them a second time. At four
+/// capabilities per message over 2000 messages that would be 8000 leaked descriptors,
+/// which blows the assertion below long before it blows the process's limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn received_descriptors_are_reclaimed() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

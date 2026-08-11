@@ -798,10 +798,10 @@ async fn parent_main(args: Vec<String>) {
 
     // ---- oversize payload behaviour
     header("payload ceiling");
-    println!("  each size is sent three times. a receive buffer too small for a message");
-    println!("  drops it and grows to fit, and this is a round trip — so an oversized");
-    println!("  payload costs one attempt to grow the server's buffer and a second to grow");
-    println!("  the client's before the third gets all the way there and back.");
+    println!("  each size is sent three times, and all three should get through: the receive");
+    println!("  loop peeks each message's length before consuming it, so a buffer that is");
+    println!("  too small grows *before* the read rather than after. a 'dropped' on the");
+    println!("  first attempt would mean that peek is not happening.");
     for payload in [4096usize, 8192, 8193, 16384, 65536] {
         let data = vec![0x41u8; payload];
         let mut outcome = ["", "", ""];
@@ -820,17 +820,17 @@ async fn parent_main(args: Vec<String>) {
             };
         }
         let note = match outcome {
-            ["intact", "intact", "intact"] => "fits both buffers as they are",
-            [_, _, "intact"] => "both buffers grew to fit",
-            _ => "STILL not getting through",
+            ["intact", "intact", "intact"] if payload <= RECV_BUF => "fits both buffers as they are",
+            ["intact", "intact", "intact"] => "buffers grew ahead of the read — nothing lost",
+            _ => "LOST a message — the peek is not covering this",
         };
         println!(
             "  {payload:>6} B  → {:<9} {:<9} {:<9}  {note}",
             outcome[0], outcome[1], outcome[2]
         );
     }
-    println!("  buffers start at {RECV_BUF} B and grow to whatever peers actually send; a message");
-    println!("  that overflows one is reported and dropped, never silently shortened.");
+    println!("  buffers start at {RECV_BUF} B and grow to whatever peers actually send, ahead of");
+    println!("  the read, so nothing is ever truncated or lost on the way up.");
 
     // ---- final resource summary
     header("resource summary");
