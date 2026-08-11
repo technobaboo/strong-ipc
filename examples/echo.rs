@@ -7,7 +7,9 @@ impl Handler for EchoHandler {
 	async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
 		let return_fd = fds.into_iter().next().unwrap();
 		let return_ref = Ref::from_owned_fd(return_fd);
-		return_ref.send(Message::from_data(data.to_vec()));
+		return_ref
+			.try_send(Message::from_data(data.to_vec()))
+			.unwrap();
 	}
 }
 pub struct EchoReplyHandler(CancellationToken);

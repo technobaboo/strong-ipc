@@ -521,21 +521,21 @@ async fn parent_main(args: Vec<String>) {
 
 	// raw samples before `summarize` eats the vectors, so percentiles aren't the only
 	// thing that survives a run — the shape of the distribution is the interesting part
-	if let Some(i) = args.iter().position(|a| a == "--dump") {
-		if let Some(path) = args.get(i + 1) {
-			let mut out = String::from("kind,ns\n");
-			for (kind, samples) in [("msg", &msg_ns), ("burst", &burst_ns), ("wake", &wake_ns)] {
-				for ns in samples.iter() {
-					out.push_str(kind);
-					out.push(',');
-					out.push_str(&ns.to_string());
-					out.push('\n');
-				}
+	if let Some(i) = args.iter().position(|a| a == "--dump")
+		&& let Some(path) = args.get(i + 1)
+	{
+		let mut out = String::from("kind,ns\n");
+		for (kind, samples) in [("msg", &msg_ns), ("burst", &burst_ns), ("wake", &wake_ns)] {
+			for ns in samples.iter() {
+				out.push_str(kind);
+				out.push(',');
+				out.push_str(&ns.to_string());
+				out.push('\n');
 			}
-			match std::fs::write(path, out) {
-				Ok(()) => println!("  samples             written to {path}"),
-				Err(e) => eprintln!("  could not write {path}: {e}"),
-			}
+		}
+		match std::fs::write(path, out) {
+			Ok(()) => println!("  samples             written to {path}"),
+			Err(e) => eprintln!("  could not write {path}: {e}"),
 		}
 	}
 

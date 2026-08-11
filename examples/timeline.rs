@@ -353,19 +353,19 @@ async fn parent_main(args: Vec<String>) {
 	if total.is_empty() {
 		println!("\nno replies came back — nothing to report");
 	} else {
-		if let Some(i) = args.iter().position(|a| a == "--dump") {
-			if let Some(p) = args.get(i + 1) {
-				let mut out = String::from("seq,a_ns,b_ns,c_ns,d_ns,total_ns\n");
-				for i in 0..total.len() {
-					out.push_str(&format!(
-						"{},{},{},{},{},{}\n",
-						seqs[i], a[i], b[i], c[i], d[i], total[i]
-					));
-				}
-				match std::fs::write(p, out) {
-					Ok(()) => println!("  samples             written to {p}"),
-					Err(e) => eprintln!("  could not write {p}: {e}"),
-				}
+		if let Some(i) = args.iter().position(|a| a == "--dump")
+			&& let Some(p) = args.get(i + 1)
+		{
+			let mut out = String::from("seq,a_ns,b_ns,c_ns,d_ns,total_ns\n");
+			for i in 0..total.len() {
+				out.push_str(&format!(
+					"{},{},{},{},{},{}\n",
+					seqs[i], a[i], b[i], c[i], d[i], total[i]
+				));
+			}
+			match std::fs::write(p, out) {
+				Ok(()) => println!("  samples             written to {p}"),
+				Err(e) => eprintln!("  could not write {p}: {e}"),
 			}
 		}
 

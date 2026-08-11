@@ -111,23 +111,23 @@ impl FdWatch {
 		let (mine, theirs) = (fd_count(self.self_pid), fd_count(self.child_pid));
 		self.peak_self.fetch_max(mine as u64, Ordering::Relaxed);
 		self.peak_child.fetch_max(theirs as u64, Ordering::Relaxed);
-		if let Ok(mut guard) = self.timeline.try_lock() {
-			if let Some((start, log)) = guard.as_mut() {
-				let t = start.elapsed().as_secs_f64();
-				if log.last().is_none_or(|(last, ..)| t - last >= 1.0) {
-					log.push((
-						t,
-						rss_kb(self.self_pid),
-						rss_kb(self.child_pid),
-						theirs as u64,
-					));
-				}
+		if let Ok(mut guard) = self.timeline.try_lock()
+			&& let Some((start, log)) = guard.as_mut()
+		{
+			let t = start.elapsed().as_secs_f64();
+			if log.last().is_none_or(|(last, ..)| t - last >= 1.0) {
+				log.push((
+					t,
+					rss_kb(self.self_pid),
+					rss_kb(self.child_pid),
+					theirs as u64,
+				));
 			}
 		}
-		if mine >= self.threshold || theirs >= self.threshold {
-			if !self.tripped.swap(true, Ordering::SeqCst) {
-				self.abort(mine, theirs, "descriptor budget exceeded");
-			}
+		if (mine >= self.threshold || theirs >= self.threshold)
+			&& !self.tripped.swap(true, Ordering::SeqCst)
+		{
+			self.abort(mine, theirs, "descriptor budget exceeded");
 		}
 	}
 
@@ -444,7 +444,7 @@ impl Client {
 			sent += 1;
 			// draining as we go keeps the reply node's queue from growing without bound
 			while self.rx.try_recv().is_ok() {}
-			if sent % 64 == 0 {
+			if sent.is_multiple_of(64) {
 				if Instant::now() >= deadline {
 					break;
 				}
@@ -491,10 +491,10 @@ fn fmt_bytes_per_sec(b: f64) -> String {
 fn main() {
 	let args: Vec<String> = std::env::args().collect();
 
-	if let Some(i) = args.iter().position(|a| a == "--fd-limit") {
-		if let Some(n) = args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-			set_nofile_limit(n);
-		}
+	if let Some(i) = args.iter().position(|a| a == "--fd-limit")
+		&& let Some(n) = args.get(i + 1).and_then(|s| s.parse::<u64>().ok())
+	{
+		set_nofile_limit(n);
 	}
 
 	if let Some(i) = args.iter().position(|a| a == "--server") {
