@@ -88,8 +88,8 @@ pub use error::{SendError, TrySendError};
 pub use message::{FdVec, Message};
 pub use node::{BoundNode, Handler, Node};
 pub use wire::{
-    EXPECTED_ANCILLARY_BUFFER_SIZE, MAX_FDS, MAX_MESSAGE_SIZE, fd_limit, maximize_fd_limit,
-    set_fd_limit,
+	EXPECTED_ANCILLARY_BUFFER_SIZE, MAX_FDS, MAX_MESSAGE_SIZE, fd_limit, maximize_fd_limit,
+	set_fd_limit,
 };
 
 /// the peer's credentials, as reported by `SCM_CREDENTIALS`
@@ -101,25 +101,25 @@ pub use rustix::net::UCred;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+	use super::*;
 
-    /// `Message` is moved by value on every send, including back out of a failed
-    /// `try_send`, so its inline descriptor storage has to stay small
-    ///
-    /// sizing the SmallVec by `MAX_FDS` instead of `EXPECTED_FDS` put roughly four
-    /// kilobytes on the stack per message, which is what made clippy's `result_large_err`
-    /// fire and had to be silenced crate-wide
-    #[test]
-    fn message_stays_small() {
-        assert!(
-            size_of::<Message>() <= 256,
-            "Message is {} B — check the inline capacity of its descriptor list",
-            size_of::<Message>()
-        );
-        assert!(
-            size_of::<FdVec>() <= 128,
-            "FdVec is {} B",
-            size_of::<FdVec>()
-        );
-    }
+	/// `Message` is moved by value on every send, including back out of a failed
+	/// `try_send`, so its inline descriptor storage has to stay small
+	///
+	/// sizing the SmallVec by `MAX_FDS` instead of `EXPECTED_FDS` put roughly four
+	/// kilobytes on the stack per message, which is what made clippy's `result_large_err`
+	/// fire and had to be silenced crate-wide
+	#[test]
+	fn message_stays_small() {
+		assert!(
+			size_of::<Message>() <= 256,
+			"Message is {} B — check the inline capacity of its descriptor list",
+			size_of::<Message>()
+		);
+		assert!(
+			size_of::<FdVec>() <= 128,
+			"FdVec is {} B",
+			size_of::<FdVec>()
+		);
+	}
 }

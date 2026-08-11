@@ -17,54 +17,54 @@ use std::time::Duration;
 use strong_ipc::{FdVec, Handler, Message, Node};
 
 struct CountFds {
-    tx: tokio::sync::mpsc::UnboundedSender<usize>,
+	tx: tokio::sync::mpsc::UnboundedSender<usize>,
 }
 
 impl Handler for CountFds {
-    async fn handle(&self, _data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
-        // dropping `fds` here is what closes the descriptors the kernel duped into us,
-        // so a leak would show up as this test running out of descriptors
-        let _ = self.tx.send(fds.len());
-    }
+	async fn handle(&self, _data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
+		// dropping `fds` here is what closes the descriptors the kernel duped into us,
+		// so a leak would show up as this test running out of descriptors
+		let _ = self.tx.send(fds.len());
+	}
 }
 
 /// `n` distinct descriptors, all naming the same open file
 fn descriptors(n: usize) -> Vec<OwnedFd> {
-    let file = std::fs::File::open("/dev/null").expect("open /dev/null");
-    (0..n)
-        .map(|_| OwnedFd::from(file.try_clone().expect("dup /dev/null")))
-        .collect()
+	let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+	(0..n)
+		.map(|_| OwnedFd::from(file.try_clone().expect("dup /dev/null")))
+		.collect()
 }
 
 async fn expect_count(counts: &[usize]) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let (_node, node_ref) = Node::new(CountFds { tx }).unwrap();
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+	let (_node, node_ref) = Node::new(CountFds { tx }).unwrap();
 
-    for &n in counts {
-        let mut message = Message::from_data(format!("carrying {n}").into_bytes());
-        for fd in descriptors(n) {
-            message.add_fd(fd);
-        }
-        node_ref
-            .try_send(message)
-            .unwrap_or_else(|e| panic!("send of {n} descriptors failed: {e:?}"));
+	for &n in counts {
+		let mut message = Message::from_data(format!("carrying {n}").into_bytes());
+		for fd in descriptors(n) {
+			message.add_fd(fd);
+		}
+		node_ref
+			.try_send(message)
+			.unwrap_or_else(|e| panic!("send of {n} descriptors failed: {e:?}"));
 
-        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for the {n}-descriptor message"))
-            .expect("channel closed");
-        assert_eq!(got, n, "sent {n} descriptors, handler saw {got}");
-    }
+		let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+			.await
+			.unwrap_or_else(|_| panic!("timed out waiting for the {n}-descriptor message"))
+			.expect("channel closed");
+		assert_eq!(got, n, "sent {n} descriptors, handler saw {got}");
+	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn descriptors_within_the_inline_buffer() {
-    expect_count(&[0, 1, 2, 8, 15, 16]).await;
+	expect_count(&[0, 1, 2, 8, 15, 16]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn descriptors_above_the_inline_buffer() {
-    expect_count(&[17, 32, 64, 128, 253]).await;
+	expect_count(&[17, 32, 64, 128, 253]).await;
 }
 
 /// descriptors must not accumulate when the same `Ref` is used over and over
@@ -81,28 +81,30 @@ async fn descriptors_above_the_inline_buffer() {
 /// which blows the assertion below long before it blows the process's limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn received_descriptors_are_reclaimed() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let (_node, node_ref) = Node::new(CountFds { tx }).unwrap();
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+	let (_node, node_ref) = Node::new(CountFds { tx }).unwrap();
 
-    let before = open_fd_count();
-    for _ in 0..2_000 {
-        let mut message = Message::from_data(b"churn".to_vec());
-        for fd in descriptors(4) {
-            message.add_fd(fd);
-        }
-        node_ref.send(message).await.expect("peer closed");
-        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
-    }
-    // let the last few drop
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let after = open_fd_count();
+	let before = open_fd_count();
+	for _ in 0..2_000 {
+		let mut message = Message::from_data(b"churn".to_vec());
+		for fd in descriptors(4) {
+			message.add_fd(fd);
+		}
+		node_ref.send(message).await.expect("peer closed");
+		let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+	}
+	// let the last few drop
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	let after = open_fd_count();
 
-    assert!(
-        after < before + 64,
-        "descriptors leaked: {before} open before, {after} after 2000 messages x 4 caps"
-    );
+	assert!(
+		after < before + 64,
+		"descriptors leaked: {before} open before, {after} after 2000 messages x 4 caps"
+	);
 }
 
 fn open_fd_count() -> usize {
-    std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
+	std::fs::read_dir("/proc/self/fd")
+		.map(|d| d.count())
+		.unwrap_or(0)
 }

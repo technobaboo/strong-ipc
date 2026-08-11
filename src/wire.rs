@@ -14,16 +14,16 @@
 use crate::message::{FdVec, Message};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::net::{
-    self, AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
-    SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
-    UCred,
+	self, AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+	SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+	UCred,
 };
 use smallvec::SmallVec;
 use std::{
-    io::{IoSlice, IoSliceMut},
-    mem::MaybeUninit,
-    os::fd::{AsFd, BorrowedFd, OwnedFd},
-    path::Path,
+	io::{IoSlice, IoSliceMut},
+	mem::MaybeUninit,
+	os::fd::{AsFd, BorrowedFd, OwnedFd},
+	path::Path,
 };
 use tokio::io::{Interest, unix::AsyncFd};
 
@@ -39,7 +39,7 @@ pub(crate) const EXPECTED_FDS: usize = 8;
 
 /// the send-side stack buffer: enough for `EXPECTED_FDS` (8) descriptors plus credentials
 pub const EXPECTED_ANCILLARY_BUFFER_SIZE: usize =
-    rustix::cmsg_space!(ScmRights(EXPECTED_FDS), ScmCredentials(1));
+	rustix::cmsg_space!(ScmRights(EXPECTED_FDS), ScmCredentials(1));
 
 /// the receive-side buffer, sized for the largest message the kernel will ever deliver
 ///
@@ -48,7 +48,7 @@ pub const EXPECTED_ANCILLARY_BUFFER_SIZE: usize =
 /// means the kernel dropped descriptors, and in a capability system a silently dropped
 /// descriptor is a capability that vanished with no error anywhere
 pub(crate) const MAX_ANCILLARY_BUFFER_SIZE: usize =
-    rustix::cmsg_space!(ScmRights(MAX_FDS), ScmCredentials(1));
+	rustix::cmsg_space!(ScmRights(MAX_FDS), ScmCredentials(1));
 
 /// the largest payload a [`Message`] may carry — **the one number to tune**
 ///
@@ -74,13 +74,13 @@ pub const MAX_MESSAGE_SIZE: usize = 8192;
 /// `RLIM_INFINITY` is `None` on the way in and [`usize::MAX`] on the way out — there is no
 /// number to report for "no limit", and the largest `usize` is the closest true thing
 fn as_count(value: Option<u64>) -> usize {
-    value.map_or(usize::MAX, |v| v.try_into().unwrap_or(usize::MAX))
+	value.map_or(usize::MAX, |v| v.try_into().unwrap_or(usize::MAX))
 }
 
 /// the inverse: [`usize::MAX`] asks for `RLIM_INFINITY`, which only a process that may
 /// raise its hard limit will actually get
 fn as_rlim(count: usize) -> Option<u64> {
-    (count != usize::MAX).then(|| u64::try_from(count).unwrap_or(u64::MAX))
+	(count != usize::MAX).then(|| u64::try_from(count).unwrap_or(u64::MAX))
 }
 
 /// this process's current open-descriptor limit — the soft `RLIMIT_NOFILE`
@@ -91,9 +91,9 @@ fn as_rlim(count: usize) -> Option<u64> {
 /// the `Result` is for symmetry with the other two, and against the day this needs a
 /// syscall that can fail; today reading the limit cannot.
 pub fn fd_limit() -> std::io::Result<usize> {
-    Ok(as_count(
-        rustix::process::getrlimit(rustix::process::Resource::Nofile).current,
-    ))
+	Ok(as_count(
+		rustix::process::getrlimit(rustix::process::Resource::Nofile).current,
+	))
 }
 
 /// sets this process's open-descriptor limit to exactly `limit`
@@ -108,20 +108,20 @@ pub fn fd_limit() -> std::io::Result<usize> {
 ///
 /// returns the new soft limit, which on success is `limit`.
 pub fn set_fd_limit(limit: usize) -> std::io::Result<usize> {
-    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+	use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
-    let current = as_rlim(limit);
-    // the hard limit is preserved rather than passed through as `None`: on Linux `None`
-    // means infinity, so echoing it back would be a request to *raise* the ceiling
-    setrlimit(
-        Resource::Nofile,
-        Rlimit {
-            current,
-            maximum: getrlimit(Resource::Nofile).maximum,
-        },
-    )?;
+	let current = as_rlim(limit);
+	// the hard limit is preserved rather than passed through as `None`: on Linux `None`
+	// means infinity, so echoing it back would be a request to *raise* the ceiling
+	setrlimit(
+		Resource::Nofile,
+		Rlimit {
+			current,
+			maximum: getrlimit(Resource::Nofile).maximum,
+		},
+	)?;
 
-    Ok(as_count(current))
+	Ok(as_count(current))
 }
 
 /// raises this process's open-descriptor limit to its hard ceiling, returning the new soft
@@ -141,39 +141,39 @@ pub fn set_fd_limit(limit: usize) -> std::io::Result<usize> {
 /// nothing and just reports it. An unlimited (`RLIM_INFINITY`) limit is reported as
 /// [`usize::MAX`], since there is no number to give.
 pub fn maximize_fd_limit() -> std::io::Result<usize> {
-    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+	use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
-    // None is RLIM_INFINITY on both fields: no ceiling to raise to, nothing to raise
-    let limit = getrlimit(Resource::Nofile);
+	// None is RLIM_INFINITY on both fields: no ceiling to raise to, nothing to raise
+	let limit = getrlimit(Resource::Nofile);
 
-    if limit.current != limit.maximum {
-        setrlimit(
-            Resource::Nofile,
-            Rlimit {
-                current: limit.maximum,
-                maximum: limit.maximum,
-            },
-        )?;
-    }
+	if limit.current != limit.maximum {
+		setrlimit(
+			Resource::Nofile,
+			Rlimit {
+				current: limit.maximum,
+				maximum: limit.maximum,
+			},
+		)?;
+	}
 
-    Ok(as_count(limit.maximum))
+	Ok(as_count(limit.maximum))
 }
 
 fn flags_for_send() -> SendFlags {
-    // DONTWAIT so this never parks the caller; NOSIGNAL so a dead peer surfaces as EPIPE
-    // instead of killing the process; EOR to mark the record boundary, which is what
-    // tokio-seqpacket did and what SOCK_SEQPACKET semantics call for
-    SendFlags::DONTWAIT | SendFlags::NOSIGNAL | SendFlags::EOR
+	// DONTWAIT so this never parks the caller; NOSIGNAL so a dead peer surfaces as EPIPE
+	// instead of killing the process; EOR to mark the record boundary, which is what
+	// tokio-seqpacket did and what SOCK_SEQPACKET semantics call for
+	SendFlags::DONTWAIT | SendFlags::NOSIGNAL | SendFlags::EOR
 }
 
 /// a connected `SOCK_SEQPACKET` pair, both ends non-blocking and close-on-exec
 pub(crate) fn socketpair() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    Ok(net::socketpair(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-        None,
-    )?)
+	Ok(net::socketpair(
+		AddressFamily::UNIX,
+		SocketType::SEQPACKET,
+		SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+		None,
+	)?)
 }
 
 /// binds a listening socket at `path`
@@ -182,29 +182,29 @@ pub(crate) fn socketpair() -> std::io::Result<(OwnedFd, OwnedFd)> {
 /// fails with `AddrInUse` rather than being clobbered, since replacing it could yank the
 /// path out from under something still alive
 pub(crate) fn bind(path: &Path) -> std::io::Result<OwnedFd> {
-    let addr = SocketAddrUnix::new(path)?;
-    let fd = net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-        None,
-    )?;
-    net::bind(&fd, &addr)?;
-    net::listen(&fd, 128)?;
-    Ok(fd)
+	let addr = SocketAddrUnix::new(path)?;
+	let fd = net::socket_with(
+		AddressFamily::UNIX,
+		SocketType::SEQPACKET,
+		SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+		None,
+	)?;
+	net::bind(&fd, &addr)?;
+	net::listen(&fd, 128)?;
+	Ok(fd)
 }
 
 /// connects to a bound socket at `path`
 pub(crate) fn connect(path: &Path) -> std::io::Result<OwnedFd> {
-    let addr = SocketAddrUnix::new(path)?;
-    let fd = net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-        None,
-    )?;
-    net::connect(&fd, &addr)?;
-    Ok(fd)
+	let addr = SocketAddrUnix::new(path)?;
+	let fd = net::socket_with(
+		AddressFamily::UNIX,
+		SocketType::SEQPACKET,
+		SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+		None,
+	)?;
+	net::connect(&fd, &addr)?;
+	Ok(fd)
 }
 
 /// one non-blocking `sendmsg`, straight to the kernel
@@ -216,103 +216,111 @@ pub(crate) fn connect(path: &Path) -> std::io::Result<OwnedFd> {
 /// the ancillary buffer is sized from the *actual* descriptor count rather than a fixed
 /// `EXPECTED_FDS` allowance, which is what lets [`MAX_FDS`] mean what it says
 pub(crate) fn send_now(fd: BorrowedFd<'_>, message: &Message) -> std::io::Result<()> {
-    let iov = [IoSlice::new(message.data())];
+	let iov = [IoSlice::new(message.data())];
 
-    // no descriptors means no control message at all. building an empty `SCM_RIGHTS`
-    // block instead would put 16 bytes of nothing on the wire and hand the receiver a
-    // spurious empty-descriptor-list to unpack
-    if message.fds().is_empty() {
-        net::sendmsg(fd, &iov, &mut SendAncillaryBuffer::default(), flags_for_send())?;
-        return Ok(());
-    }
+	// no descriptors means no control message at all. building an empty `SCM_RIGHTS`
+	// block instead would put 16 bytes of nothing on the wire and hand the receiver a
+	// spurious empty-descriptor-list to unpack
+	if message.fds().is_empty() {
+		net::sendmsg(
+			fd,
+			&iov,
+			&mut SendAncillaryBuffer::default(),
+			flags_for_send(),
+		)?;
+		return Ok(());
+	}
 
-    let borrowed: SmallVec<[BorrowedFd<'_>; EXPECTED_FDS]> =
-        message.fds().iter().map(|f| f.as_fd()).collect();
+	let borrowed: SmallVec<[BorrowedFd<'_>; EXPECTED_FDS]> =
+		message.fds().iter().map(|f| f.as_fd()).collect();
 
-    let mut stack = [MaybeUninit::uninit(); EXPECTED_ANCILLARY_BUFFER_SIZE];
-    let mut spilled;
-    let space: &mut [MaybeUninit<u8>] = if borrowed.len() <= EXPECTED_FDS {
-        &mut stack
-    } else {
-        spilled = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(borrowed.len()))];
-        &mut spilled
-    };
+	let mut stack = [MaybeUninit::uninit(); EXPECTED_ANCILLARY_BUFFER_SIZE];
+	let mut spilled;
+	let space: &mut [MaybeUninit<u8>] = if borrowed.len() <= EXPECTED_FDS {
+		&mut stack
+	} else {
+		spilled = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(borrowed.len()))];
+		&mut spilled
+	};
 
-    let mut control = SendAncillaryBuffer::new(space);
-    if !control.push(SendAncillaryMessage::ScmRights(&borrowed)) {
-        // the buffer is sized from `borrowed.len()` immediately above, so this cannot
-        // happen unless that sizing is wrong
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("could not fit {} descriptors in the control buffer", borrowed.len()),
-        ));
-    }
-    net::sendmsg(fd, &iov, &mut control, flags_for_send())?;
-    Ok(())
+	let mut control = SendAncillaryBuffer::new(space);
+	if !control.push(SendAncillaryMessage::ScmRights(&borrowed)) {
+		// the buffer is sized from `borrowed.len()` immediately above, so this cannot
+		// happen unless that sizing is wrong
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidInput,
+			format!(
+				"could not fit {} descriptors in the control buffer",
+				borrowed.len()
+			),
+		));
+	}
+	net::sendmsg(fd, &iov, &mut control, flags_for_send())?;
+	Ok(())
 }
 
 /// what came off the wire
 pub(crate) struct Received {
-    /// the true length of the datagram, which may exceed the buffer it was read into
-    ///
-    /// `MSG_TRUNC` is always requested, so this is the real size even when the message
-    /// did not fit — which is what lets the receive loop grow to match its peers instead
-    /// of silently delivering a shortened payload
-    pub bytes: usize,
-    pub fds: FdVec,
-    pub creds: Option<UCred>,
+	/// the true length of the datagram, which may exceed the buffer it was read into
+	///
+	/// `MSG_TRUNC` is always requested, so this is the real size even when the message
+	/// did not fit — which is what lets the receive loop grow to match its peers instead
+	/// of silently delivering a shortened payload
+	pub bytes: usize,
+	pub fds: FdVec,
+	pub creds: Option<UCred>,
 }
 
 impl Received {
-    /// did the payload not fit in the buffer it was read into?
-    pub fn truncated(&self, buffer_len: usize) -> bool {
-        self.bytes > buffer_len
-    }
+	/// did the payload not fit in the buffer it was read into?
+	pub fn truncated(&self, buffer_len: usize) -> bool {
+		self.bytes > buffer_len
+	}
 }
 
 /// one non-blocking `recvmsg`
 pub(crate) fn recv_now(
-    fd: BorrowedFd<'_>,
-    buf: &mut [u8],
-    control_space: &mut [MaybeUninit<u8>],
+	fd: BorrowedFd<'_>,
+	buf: &mut [u8],
+	control_space: &mut [MaybeUninit<u8>],
 ) -> std::io::Result<Received> {
-    let mut iov = [IoSliceMut::new(buf)];
-    let mut ancillary = RecvAncillaryBuffer::new(control_space);
-    // CMSG_CLOEXEC so a received descriptor can't leak through an exec that races with
-    // us; TRUNC so `bytes` reports the datagram's real length rather than what we caught
-    let msg = net::recvmsg(
-        fd,
-        &mut iov,
-        &mut ancillary,
-        RecvFlags::CMSG_CLOEXEC | RecvFlags::TRUNC,
-    )?;
+	let mut iov = [IoSliceMut::new(buf)];
+	let mut ancillary = RecvAncillaryBuffer::new(control_space);
+	// CMSG_CLOEXEC so a received descriptor can't leak through an exec that races with
+	// us; TRUNC so `bytes` reports the datagram's real length rather than what we caught
+	let msg = net::recvmsg(
+		fd,
+		&mut iov,
+		&mut ancillary,
+		RecvFlags::CMSG_CLOEXEC | RecvFlags::TRUNC,
+	)?;
 
-    let mut fds = FdVec::new();
-    let mut creds = None;
-    for ancillary_message in ancillary.drain() {
-        match ancillary_message {
-            RecvAncillaryMessage::ScmRights(received) => fds.extend(received),
-            RecvAncillaryMessage::ScmCredentials(c) => creds = Some(c),
-            _ => (),
-        }
-    }
-    debug_assert!(
-        !msg.flags.contains(ReturnFlags::CTRUNC),
-        "control buffer too small — descriptors were dropped by the kernel"
-    );
-    Ok(Received {
-        bytes: msg.bytes,
-        fds,
-        creds,
-    })
+	let mut fds = FdVec::new();
+	let mut creds = None;
+	for ancillary_message in ancillary.drain() {
+		match ancillary_message {
+			RecvAncillaryMessage::ScmRights(received) => fds.extend(received),
+			RecvAncillaryMessage::ScmCredentials(c) => creds = Some(c),
+			_ => (),
+		}
+	}
+	debug_assert!(
+		!msg.flags.contains(ReturnFlags::CTRUNC),
+		"control buffer too small — descriptors were dropped by the kernel"
+	);
+	Ok(Received {
+		bytes: msg.bytes,
+		fds,
+		creds,
+	})
 }
 
 /// accepts one pending connection, non-blocking
 pub(crate) fn accept_now(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
-    Ok(net::accept_with(
-        fd,
-        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-    )?)
+	Ok(net::accept_with(
+		fd,
+		SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+	)?)
 }
 
 /// asks the kernel to stamp every incoming message with the sender's credentials
@@ -325,7 +333,7 @@ pub(crate) fn accept_now(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
 /// best-effort: a socket that refuses the option simply reports `None` credentials rather
 /// than failing to receive
 pub(crate) fn enable_credentials(fd: BorrowedFd<'_>) {
-    let _ = net::sockopt::set_socket_passcred(fd, true);
+	let _ = net::sockopt::set_socket_passcred(fd, true);
 }
 
 /// is the far end of this connected socket gone?
@@ -346,14 +354,14 @@ pub(crate) fn enable_credentials(fd: BorrowedFd<'_>) {
 ///
 /// [`Ref`]: crate::Ref
 pub(crate) fn is_hung_up(fd: BorrowedFd<'_>) -> bool {
-    let mut poll_fds = [PollFd::new(&fd, PollFlags::empty())];
-    match rustix::event::poll(&mut poll_fds, Some(&Timespec::default())) {
-        // a socket we cannot poll is not evidence of a dead peer, so say nothing
-        Err(_) => false,
-        Ok(_) => poll_fds[0]
-            .revents()
-            .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
-    }
+	let mut poll_fds = [PollFd::new(&fd, PollFlags::empty())];
+	match rustix::event::poll(&mut poll_fds, Some(&Timespec::default())) {
+		// a socket we cannot poll is not evidence of a dead peer, so say nothing
+		Err(_) => false,
+		Ok(_) => poll_fds[0]
+			.revents()
+			.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
+	}
 }
 
 /// a socket registered with the tokio reactor
@@ -365,81 +373,81 @@ pub(crate) fn is_hung_up(fd: BorrowedFd<'_>) -> bool {
 /// **must be constructed inside runtime context** — `AsyncFd::new` registers with the
 /// reactor, and holding a `runtime::Handle` is not the same as being entered into it
 pub(crate) struct Reactive {
-    io: AsyncFd<OwnedFd>,
+	io: AsyncFd<OwnedFd>,
 }
 
 impl Reactive {
-    pub(crate) fn new(fd: OwnedFd) -> std::io::Result<Self> {
-        Ok(Self {
-            io: AsyncFd::new(fd)?,
-        })
-    }
+	pub(crate) fn new(fd: OwnedFd) -> std::io::Result<Self> {
+		Ok(Self {
+			io: AsyncFd::new(fd)?,
+		})
+	}
 
-    /// waits for room, then sends
-    ///
-    /// the same `send_now` the inline fast path uses, with readiness in front of it
-    pub(crate) async fn send(&self, message: &Message) -> std::io::Result<()> {
-        loop {
-            let mut guard = self.io.writable().await?;
-            // `try_io` clears the readiness flag itself when the closure reports
-            // WouldBlock, so there is no manual clear_ready to forget
-            match guard.try_io(|inner| send_now(inner.get_ref().as_fd(), message)) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
-        }
-    }
+	/// waits for room, then sends
+	///
+	/// the same `send_now` the inline fast path uses, with readiness in front of it
+	pub(crate) async fn send(&self, message: &Message) -> std::io::Result<()> {
+		loop {
+			let mut guard = self.io.writable().await?;
+			// `try_io` clears the readiness flag itself when the closure reports
+			// WouldBlock, so there is no manual clear_ready to forget
+			match guard.try_io(|inner| send_now(inner.get_ref().as_fd(), message)) {
+				Ok(result) => return result,
+				Err(_would_block) => continue,
+			}
+		}
+	}
 
-    /// receives the next message
-    ///
-    /// one syscall, no size probe: `buf` is always [`MAX_MESSAGE_SIZE`] and no accepted
-    /// send can exceed that, so a message from a peer using this crate always fits.
-    /// `MSG_TRUNC` is still requested so that a peer *not* using this crate — which the
-    /// kernel would let send up to `SO_SNDBUF` — is detected rather than silently
-    /// delivering a shortened payload
-    pub(crate) async fn recv(
-        &self,
-        buf: &mut [u8],
-        control_space: &mut [MaybeUninit<u8>],
-    ) -> std::io::Result<Received> {
-        loop {
-            let mut guard = self.io.readable().await?;
-            match guard.try_io(|inner| recv_now(inner.get_ref().as_fd(), buf, control_space)) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
-        }
-    }
+	/// receives the next message
+	///
+	/// one syscall, no size probe: `buf` is always [`MAX_MESSAGE_SIZE`] and no accepted
+	/// send can exceed that, so a message from a peer using this crate always fits.
+	/// `MSG_TRUNC` is still requested so that a peer *not* using this crate — which the
+	/// kernel would let send up to `SO_SNDBUF` — is detected rather than silently
+	/// delivering a shortened payload
+	pub(crate) async fn recv(
+		&self,
+		buf: &mut [u8],
+		control_space: &mut [MaybeUninit<u8>],
+	) -> std::io::Result<Received> {
+		loop {
+			let mut guard = self.io.readable().await?;
+			match guard.try_io(|inner| recv_now(inner.get_ref().as_fd(), buf, control_space)) {
+				Ok(result) => return result,
+				Err(_would_block) => continue,
+			}
+		}
+	}
 
-    /// parks until the far end of this socket is gone
-    ///
-    /// `epoll` reports `EPOLLHUP`/`EPOLLERR` regardless of the interest mask, so a
-    /// hangup wakes this even though nothing is being read. Anything else that makes the
-    /// socket readable — a peer that talks back on what we only ever send on — is cleared
-    /// and waited on again, which is why this is a loop rather than a single `.await`.
-    ///
-    /// a reactor that reports an error is the runtime going away underneath us. There is
-    /// no way to keep watching after that, and hanging forever inside someone's `select!`
-    /// is the worse failure, so it reports death.
-    pub(crate) async fn hangup(&self) {
-        loop {
-            let Ok(mut guard) = self.io.ready(Interest::READABLE | Interest::ERROR).await else {
-                return;
-            };
-            if guard.ready().is_read_closed() || guard.ready().is_error() {
-                return;
-            }
-            guard.clear_ready();
-        }
-    }
+	/// parks until the far end of this socket is gone
+	///
+	/// `epoll` reports `EPOLLHUP`/`EPOLLERR` regardless of the interest mask, so a
+	/// hangup wakes this even though nothing is being read. Anything else that makes the
+	/// socket readable — a peer that talks back on what we only ever send on — is cleared
+	/// and waited on again, which is why this is a loop rather than a single `.await`.
+	///
+	/// a reactor that reports an error is the runtime going away underneath us. There is
+	/// no way to keep watching after that, and hanging forever inside someone's `select!`
+	/// is the worse failure, so it reports death.
+	pub(crate) async fn hangup(&self) {
+		loop {
+			let Ok(mut guard) = self.io.ready(Interest::READABLE | Interest::ERROR).await else {
+				return;
+			};
+			if guard.ready().is_read_closed() || guard.ready().is_error() {
+				return;
+			}
+			guard.clear_ready();
+		}
+	}
 
-    pub(crate) async fn accept(&self) -> std::io::Result<OwnedFd> {
-        loop {
-            let mut guard = self.io.readable().await?;
-            match guard.try_io(|inner| accept_now(inner.get_ref().as_fd())) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
-        }
-    }
+	pub(crate) async fn accept(&self) -> std::io::Result<OwnedFd> {
+		loop {
+			let mut guard = self.io.readable().await?;
+			match guard.try_io(|inner| accept_now(inner.get_ref().as_fd())) {
+				Ok(result) => return result,
+				Err(_would_block) => continue,
+			}
+		}
+	}
 }

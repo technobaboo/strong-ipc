@@ -17,51 +17,51 @@ pub type FdVec = SmallVec<[OwnedFd; EXPECTED_FDS]>;
 /// leaves yours alone, so this just has to keep something alive that can hand out a
 /// [`BorrowedFd`] at send time. never needs a local `dup` either way
 pub(crate) enum SendFd {
-    /// a fd owned outright, e.g. forwarded out of `Handler::handle`
-    Owned(OwnedFd),
-    /// a clone of a [`Ref`], shared rather than duped
-    Ref(Ref),
+	/// a fd owned outright, e.g. forwarded out of `Handler::handle`
+	Owned(OwnedFd),
+	/// a clone of a [`Ref`], shared rather than duped
+	Ref(Ref),
 }
 impl AsFd for SendFd {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        match self {
-            SendFd::Owned(fd) => fd.as_fd(),
-            SendFd::Ref(r) => r.borrowed_fd(),
-        }
-    }
+	fn as_fd(&self) -> BorrowedFd<'_> {
+		match self {
+			SendFd::Owned(fd) => fd.as_fd(),
+			SendFd::Ref(r) => r.borrowed_fd(),
+		}
+	}
 }
 
 pub struct Message {
-    data: Vec<u8>,
-    fds: SmallVec<[SendFd; EXPECTED_FDS]>,
+	data: Vec<u8>,
+	fds: SmallVec<[SendFd; EXPECTED_FDS]>,
 }
 impl Message {
-    pub fn from_data(data: Vec<u8>) -> Self {
-        Self {
-            data,
-            fds: SmallVec::new(),
-        }
-    }
-    /// embeds `r`'s socket so its fd goes over the wire
-    ///
-    /// `r` stays usable after, and can go on as many messages as you want
-    pub fn add_ref(&mut self, r: &Ref) {
-        self.fds.push(SendFd::Ref(r.clone()));
-    }
-    /// embeds a raw received fd, e.g. to forward one out of `Handler::handle`
-    pub fn add_fd(&mut self, fd: OwnedFd) {
-        self.fds.push(SendFd::Owned(fd));
-    }
+	pub fn from_data(data: Vec<u8>) -> Self {
+		Self {
+			data,
+			fds: SmallVec::new(),
+		}
+	}
+	/// embeds `r`'s socket so its fd goes over the wire
+	///
+	/// `r` stays usable after, and can go on as many messages as you want
+	pub fn add_ref(&mut self, r: &Ref) {
+		self.fds.push(SendFd::Ref(r.clone()));
+	}
+	/// embeds a raw received fd, e.g. to forward one out of `Handler::handle`
+	pub fn add_fd(&mut self, fd: OwnedFd) {
+		self.fds.push(SendFd::Owned(fd));
+	}
 
-    /// the payload
-    ///
-    /// public mainly so a caller can inspect a message handed back by a failed send —
-    /// [`crate::TrySendError::TooLarge`] in particular, where the useful next step is to
-    /// look at how big it actually is
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
-    pub(crate) fn fds(&self) -> &[SendFd] {
-        &self.fds
-    }
+	/// the payload
+	///
+	/// public mainly so a caller can inspect a message handed back by a failed send —
+	/// [`crate::TrySendError::TooLarge`] in particular, where the useful next step is to
+	/// look at how big it actually is
+	pub fn data(&self) -> &[u8] {
+		&self.data
+	}
+	pub(crate) fn fds(&self) -> &[SendFd] {
+		&self.fds
+	}
 }
