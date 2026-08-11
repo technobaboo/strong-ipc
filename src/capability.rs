@@ -20,6 +20,13 @@ struct RefInner {
     /// sync and may not be running on a runtime thread
     runtime: Option<tokio::runtime::Handle>,
     outbox: OnceLock<Outbox>,
+    /// built only if someone actually awaits [`Ref::death_notification`]
+    ///
+    /// same bargain as the outbox: a reactor registration is exactly what a `Ref` exists
+    /// to avoid paying per capability received, so it is deferred until asked for. Once
+    /// built it is shared by every waiter on this `Ref` and every later call, so watching
+    /// costs one `epoll_ctl` per `Ref` that ever asks, not one per wait
+    death: OnceLock<wire::Reactive>,
 }
 
 impl RefInner {
@@ -33,6 +40,25 @@ impl RefInner {
         let _ = self.outbox.set(built);
         Ok(self
             .outbox
+            .get()
+            .expect("just set, or set by whoever raced us"))
+    }
+
+    /// the socket registered with the reactor, so a hangup can be awaited
+    ///
+    /// a *dup*, not the `Ref`'s own fd, for the same reason the outbox uses one: the
+    /// `Ref`'s fd stays out of the reactor so the inline send path never touches it.
+    /// Both name the same open file description, so the dup sees the same hangup.
+    fn death_watch(&self) -> std::io::Result<&wire::Reactive> {
+        if let Some(watch) = self.death.get() {
+            return Ok(watch);
+        }
+        let built = wire::Reactive::new(self.fd.try_clone()?)?;
+        // whoever raced us has an equally good watch on the same file description, so
+        // ours drops here, deregistering the dup it just added
+        let _ = self.death.set(built);
+        Ok(self
+            .death
             .get()
             .expect("just set, or set by whoever raced us"))
     }
@@ -72,7 +98,58 @@ impl Ref {
                 fd,
                 runtime: tokio::runtime::Handle::try_current().ok(),
                 outbox: OnceLock::new(),
+                death: OnceLock::new(),
             }),
+        }
+    }
+
+    /// is the node behind this capability gone?
+    ///
+    /// a `Ref` is only worth as much as the node on the other end, and nothing else in
+    /// this crate will tell you it has gone: sends fail with [`TrySendError::Closed`],
+    /// but only once you have a message to lose. This asks without one.
+    ///
+    /// costs a single `ppoll` — no reactor registration, no allocation, no task — so it
+    /// is fine to call on a `Ref` you were just handed and may never send to. The answer
+    /// is one-way: a dead `Ref` never becomes live again, so a `false` can go stale but a
+    /// `true` cannot.
+    ///
+    /// `false` is not a promise the next send will land — the peer may be closing as you
+    /// ask, and there is nothing that could close that window. Treat this as "worth
+    /// trying" rather than "guaranteed to arrive", and keep handling `Closed` on send.
+    pub fn is_dead(&self) -> bool {
+        wire::is_hung_up(self.inner.fd.as_fd())
+    }
+
+    /// resolves when the node behind this capability is gone
+    ///
+    /// returns immediately if it already is. Meant to be raced against your own work:
+    ///
+    /// ```no_run
+    /// # async fn f(peer: strong_ipc::Ref, mut work: impl Future<Output = ()> + Unpin) {
+    /// tokio::select! {
+    ///     () = peer.death_notification() => return, // nobody left to answer to
+    ///     () = &mut work => {}
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// unlike [`Ref::is_dead`] this registers the socket with the reactor, which is the
+    /// cost a `Ref` normally refuses to pay — so it happens on the first call and not
+    /// before. The registration is shared by every waiter and outlives the wait, so a
+    /// `Ref` that is watched repeatedly pays once and a `Ref` that is never watched pays
+    /// nothing.
+    ///
+    /// if the registration cannot be made at all — descriptor limit, no runtime — this
+    /// never resolves, rather than claiming a death that has not happened. Guard against
+    /// that with a timeout if a stuck waiter would wedge you.
+    pub async fn death_notification(&self) {
+        if self.is_dead() {
+            return;
+        }
+        match self.inner.death_watch() {
+            Ok(watch) => watch.hangup().await,
+            Err(_) => std::future::pending().await,
         }
     }
 

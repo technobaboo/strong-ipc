@@ -2,6 +2,7 @@
 
 use crate::{
     Ref,
+    death::Death,
     message::FdVec,
     wire::{self, MAX_ANCILLARY_BUFFER_SIZE, MAX_MESSAGE_SIZE, Reactive},
 };
@@ -24,28 +25,94 @@ pub trait Handler: Send + Sync + 'static {
     ) -> impl Future<Output = ()> + Send + Sync;
 }
 
+/// a node on a socketpair, reached with the [`Ref`] handed back beside it
+///
+/// deliberately does **not** hold that `Ref`. A node keeping a capability to itself would
+/// pin its own socket open forever, and the socket hanging up is precisely the signal
+/// that nobody can reach this node any more — see [`Node::is_dead`]. Holding it would
+/// also make the node a cycle waiting to happen, since the `Ref` is the thing you hand
+/// out and the node is the thing that would then never be droppable by anyone else.
 pub struct Node<H: Handler> {
     handler: Arc<H>,
-    ref_: Ref,
+    death: Arc<Death>,
     _task: AbortOnDrop,
 }
 impl<H: Handler> Node<H> {
-    pub fn new(handler: H) -> std::io::Result<Node<H>> {
+    /// builds a node and the one capability that reaches it
+    ///
+    /// the `Ref` is yours to keep, clone, and hand out; the node has no copy of its own.
+    /// Drop every `Ref` and the node's socket hangs up, its receive loop ends, and
+    /// [`Node::is_dead`] goes true — which is the whole reason the pair is split.
+    #[must_use = "the Ref is the only way to reach this node — a Node holds no capability \
+                  to itself, so dropping the Ref here hangs the node's socket up \
+                  immediately and it will never receive anything"]
+    pub fn new(handler: H) -> std::io::Result<(Node<H>, Ref)> {
         Node::new_raw(Arc::new(handler))
     }
-    pub fn new_raw(handler: Arc<H>) -> std::io::Result<Node<H>> {
+    /// [`Node::new`] for a handler you already share elsewhere
+    #[must_use = "the Ref is the only way to reach this node — a Node holds no capability \
+                  to itself, so dropping the Ref here hangs the node's socket up \
+                  immediately and it will never receive anything"]
+    pub fn new_raw(handler: Arc<H>) -> std::io::Result<(Node<H>, Ref)> {
         let (tx, rx) = wire::socketpair()?;
         wire::enable_credentials(rx.as_fd());
-        let task = tokio::spawn(recv_loop(handler.clone(), Reactive::new(rx)?));
-        Ok(Self {
-            handler,
-            ref_: Ref::from_fd(tx),
-            _task: AbortOnDrop::new(task.abort_handle()),
-        })
+        // built out here, not in the task: `AsyncFd::new` needs runtime context, and
+        // failing to register should be this call's error rather than a task that dies
+        let socket = Reactive::new(rx)?;
+        let death = Arc::new(Death::default());
+        let task = tokio::spawn({
+            let handler = handler.clone();
+            let tombstone = death.tombstone();
+            async move {
+                let _tombstone = tombstone;
+                recv_loop(handler, socket).await
+            }
+        });
+        Ok((
+            Self {
+                handler,
+                death,
+                _task: AbortOnDrop::new(task.abort_handle()),
+            },
+            Ref::from_fd(tx),
+        ))
     }
-    /// a `Ref` pointing back at this node, alive as long as the node is
-    pub fn get_ref(&self) -> &Ref {
-        &self.ref_
+
+    /// has this node stopped receiving?
+    ///
+    /// this is the mirror of [`Ref::is_dead`]: that one asks whether the node behind a
+    /// capability is gone, this one asks whether every capability to this node is. Since
+    /// a `Node` holds no `Ref` to itself, dropping the last one really does hang its
+    /// socket up, and the receive loop sees it.
+    ///
+    /// what it literally reports is the receive loop no longer running, which is the
+    /// broader statement and the one you want — nothing sent here will be handled again.
+    /// Besides the last `Ref` going, that covers an io error on the socket and a panic in
+    /// a handler. It is a latch: never false again once true.
+    ///
+    /// a plain atomic load. The receive loop is already watching the socket, so unlike
+    /// [`Ref::is_dead`] there is nothing to ask the kernel.
+    pub fn is_dead(&self) -> bool {
+        self.death.is_dead()
+    }
+
+    /// resolves when this node stops receiving; see [`Node::is_dead`] for what that means
+    ///
+    /// returns immediately if it already has. Costs nothing until awaited and needs no
+    /// reactor registration, so unlike [`Ref::death_notification`] there is no reason not
+    /// to use it. Awaiting this is the ordinary way to keep a node alive for exactly as
+    /// long as somebody can still reach it:
+    ///
+    /// ```no_run
+    /// # async fn f<H: strong_ipc::Handler>(handler: H) -> std::io::Result<()> {
+    /// let (node, capability) = strong_ipc::Node::new(handler)?;
+    /// hand_out(capability);
+    /// node.death_notification().await; // returns once the last Ref is dropped
+    /// # Ok(()) }
+    /// # fn hand_out(_: strong_ipc::Ref) {}
+    /// ```
+    pub async fn death_notification(&self) {
+        self.death.wait().await;
     }
     /// the handler this node is feeding
     ///

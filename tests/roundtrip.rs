@@ -20,9 +20,10 @@ impl Handler for Collector {
 type Delivered = (Vec<u8>, Vec<OwnedFd>);
 type Inbox = tokio::sync::mpsc::UnboundedReceiver<Delivered>;
 
-fn collector() -> (Node<Collector>, Inbox) {
+fn collector() -> (Node<Collector>, Ref, Inbox) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    (Node::new(Collector { tx }).unwrap(), rx)
+    let (node, node_ref) = Node::new(Collector { tx }).unwrap();
+    (node, node_ref, rx)
 }
 
 async fn next(rx: &mut Inbox) -> Delivered {
@@ -34,13 +35,13 @@ async fn next(rx: &mut Inbox) -> Delivered {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn payloads_arrive_intact() {
-    let (node, mut rx) = collector();
+    let (_node, node_ref, mut rx) = collector();
 
     // 8192 is where `recv_loop`'s buffer starts, so these all fit without it having to
     // grow — the growth path itself is covered by the payload-ceiling phase in bench.rs
     for len in [1usize, 2, 64, 512, 4096, 8191, 8192] {
         let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-        node.get_ref()
+        node_ref
             .try_send(Message::from_data(payload.clone()))
             .unwrap();
         let (got, fds) = next(&mut rx).await;
@@ -58,9 +59,9 @@ async fn payloads_arrive_intact() {
 /// the quirk is a decision and not a surprise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_length_message_looks_like_a_hangup() {
-    let (node, mut rx) = collector();
+    let (_node, node_ref, mut rx) = collector();
 
-    node.get_ref()
+    node_ref
         .try_send(Message::from_data(Vec::new()))
         .unwrap();
     // nothing is delivered to the handler
@@ -74,7 +75,7 @@ async fn zero_length_message_looks_like_a_hangup() {
     // dropping everything after it
     assert!(
         matches!(
-            node.get_ref()
+            node_ref
                 .try_send(Message::from_data(b"after".to_vec())),
             Err(TrySendError::Closed(_))
         ),
@@ -96,12 +97,12 @@ impl Handler for Echo {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reply_travels_back_over_an_attached_capability() {
-    let echo = Node::new(Echo).unwrap();
-    let (mine, mut rx) = collector();
+    let (_echo, echo_ref) = Node::new(Echo).unwrap();
+    let (_mine, mine_ref, mut rx) = collector();
 
     let mut message = Message::from_data(b"ping".to_vec());
-    message.add_ref(mine.get_ref());
-    echo.get_ref().try_send(message).unwrap();
+    message.add_ref(&mine_ref);
+    echo_ref.try_send(message).unwrap();
 
     let (got, _) = next(&mut rx).await;
     assert_eq!(got, b"ping");
@@ -113,10 +114,10 @@ async fn a_forwarded_descriptor_is_usable_on_the_far_side() {
     std::fs::write(&path, b"capability payload").unwrap();
     let file = std::fs::File::open(&path).unwrap();
 
-    let (node, mut rx) = collector();
+    let (_node, node_ref, mut rx) = collector();
     let mut message = Message::from_data(b"here is a file".to_vec());
     message.add_fd(OwnedFd::from(file));
-    node.get_ref().try_send(message).unwrap();
+    node_ref.try_send(message).unwrap();
 
     let (got, fds) = next(&mut rx).await;
     assert_eq!(got, b"here is a file");
@@ -149,9 +150,9 @@ impl Handler for Creds {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn messages_arrive_stamped_with_peer_credentials() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = Node::new(Creds { tx }).unwrap();
+    let (_node, node_ref) = Node::new(Creds { tx }).unwrap();
 
-    node.get_ref()
+    node_ref
         .send(Message::from_data(b"who am i".to_vec()))
         .await
         .expect("peer closed");
@@ -179,10 +180,10 @@ async fn messages_arrive_stamped_with_peer_credentials() {
 /// message and can shrink it or move the bulk behind a descriptor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_messages_are_refused_at_the_sender() {
-    let (node, mut rx) = collector();
+    let (_node, node_ref, mut rx) = collector();
 
     // the largest accepted payload still goes through
-    node.get_ref()
+    node_ref
         .send(Message::from_data(vec![1u8; strong_ipc::MAX_MESSAGE_SIZE]))
         .await
         .expect("a payload of exactly MAX_MESSAGE_SIZE should be accepted");
@@ -192,8 +193,7 @@ async fn oversized_messages_are_refused_at_the_sender() {
     // one byte more is refused, and comes back intact
     for over in [1usize, 8, 4096, 57344] {
         let len = strong_ipc::MAX_MESSAGE_SIZE + over;
-        let err = node
-            .get_ref()
+        let err = node_ref
             .try_send(Message::from_data(vec![2u8; len]))
             .expect_err("a payload over MAX_MESSAGE_SIZE should be refused");
         match err {
@@ -211,7 +211,7 @@ async fn oversized_messages_are_refused_at_the_sender() {
     // and `send` reports it too, rather than waiting forever for room that would never help
     assert!(
         matches!(
-            node.get_ref()
+            node_ref
                 .send(Message::from_data(vec![3u8; strong_ipc::MAX_MESSAGE_SIZE + 1]))
                 .await,
             Err(strong_ipc::SendError::TooLarge(_))

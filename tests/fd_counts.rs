@@ -13,7 +13,6 @@
 //! is sized for `MAX_FDS` up front, so both ends of that boundary are covered here.
 
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::time::Duration;
 use strong_ipc::{FdVec, Handler, Message, Node};
 
@@ -39,14 +38,14 @@ fn descriptors(n: usize) -> Vec<OwnedFd> {
 
 async fn expect_count(counts: &[usize]) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = Node::new(CountFds { tx }).unwrap();
+    let (_node, node_ref) = Node::new(CountFds { tx }).unwrap();
 
     for &n in counts {
         let mut message = Message::from_data(format!("carrying {n}").into_bytes());
         for fd in descriptors(n) {
             message.add_fd(fd);
         }
-        node.get_ref()
+        node_ref
             .try_send(message)
             .unwrap_or_else(|e| panic!("send of {n} descriptors failed: {e:?}"));
 
@@ -83,7 +82,7 @@ async fn descriptors_above_the_inline_buffer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn received_descriptors_are_reclaimed() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = Arc::new(Node::new(CountFds { tx }).unwrap());
+    let (_node, node_ref) = Node::new(CountFds { tx }).unwrap();
 
     let before = open_fd_count();
     for _ in 0..2_000 {
@@ -91,7 +90,7 @@ async fn received_descriptors_are_reclaimed() {
         for fd in descriptors(4) {
             message.add_fd(fd);
         }
-        node.get_ref().send(message).await.expect("peer closed");
+        node_ref.send(message).await.expect("peer closed");
         let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
     }
     // let the last few drop

@@ -40,9 +40,10 @@ impl Handler for Collector {
     }
 }
 
-fn collector() -> (Node<Collector>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+fn collector() -> (Node<Collector>, Ref, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    (Node::new(Collector { tx }).unwrap(), rx)
+    let (node, node_ref) = Node::new(Collector { tx }).unwrap();
+    (node, node_ref, rx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -51,10 +52,10 @@ async fn connect_and_echo_over_a_bound_socket() {
     let _server = BoundNode::bind(&path, Echo { tag: "S:", served: AtomicU32::new(0) }).unwrap();
 
     let server_ref = Ref::connect(&path).await.unwrap();
-    let (mine, mut rx) = collector();
+    let (_mine, mine_ref, mut rx) = collector();
 
     let mut message = Message::from_data(b"knock".to_vec());
-    message.add_ref(mine.get_ref());
+    message.add_ref(&mine_ref);
     server_ref.try_send(message).unwrap();
 
     let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -105,11 +106,11 @@ async fn concurrent_clients_share_one_handler() {
 
     let a = Ref::connect(&path).await.unwrap();
     let b = Ref::connect(&path).await.unwrap();
-    let (mine, mut rx) = collector();
+    let (_mine, mine_ref, mut rx) = collector();
 
     for (r, body) in [(&a, &b"one"[..]), (&b, &b"two"[..])] {
         let mut m = Message::from_data(body.to_vec());
-        m.add_ref(mine.get_ref());
+        m.add_ref(&mine_ref);
         r.try_send(m).unwrap();
     }
 

@@ -57,10 +57,26 @@
 //! | `capability` | [`Ref`] and its two-tier send |
 //! | `outbox` | the backlog a `Ref` grows only once its socket backs up |
 //! | `node` | [`Handler`], [`Node`], [`BoundNode`], and the receive loop |
+//! | `death` | the latch behind [`Node::is_dead`]; `Ref`'s answer comes from the kernel |
+//!
+//! # Knowing when the other end is gone
+//!
+//! [`Ref::is_dead`] and [`Ref::death_notification`] answer for the node behind a
+//! capability, so you can drop a `Ref` that leads nowhere without first losing a message
+//! to [`TrySendError::Closed`]. `is_dead` is one `ppoll` and keeps the `Ref` out of the
+//! reactor; awaiting the notification is what finally registers it, once per `Ref` that
+//! ever asks.
+//!
+//! [`Node`] has the mirror pair, answering "can anyone still reach me?". That works
+//! because [`Node::new`] hands the node's one capability *back to you* rather than
+//! keeping it — a node holding a `Ref` to itself could never see its own socket hang up.
+//! So dropping the last `Ref` ends the node's receive loop, and [`Node::is_dead`] says
+//! so.
 
 #![forbid(unsafe_code)]
 
 mod capability;
+mod death;
 mod error;
 mod message;
 mod node;

@@ -36,12 +36,12 @@ pub async fn main() {
     // connecting only gets a ref pointing at the server, nothing comes back over it. so
     // we make a node of our own and hand the server the cap to reach it on the message
     let done = CancellationToken::new();
-    let reply_node = Node::new(ReplyHandler(done.clone())).unwrap();
+    let (_reply_node, reply_node_ref) = Node::new(ReplyHandler(done.clone())).unwrap();
 
     let text = format!("hello from pid {}", std::process::id());
     println!("sending {text:?}");
     let mut message = Message::from_data(text.into_bytes());
-    message.add_ref(reply_node.get_ref());
+    message.add_ref(&reply_node_ref);
     server.try_send(message).unwrap();
 
     tokio::time::timeout(Duration::from_secs(10), done.cancelled())

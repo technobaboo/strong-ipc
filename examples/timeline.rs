@@ -270,7 +270,7 @@ async fn parent_main(args: Vec<String>) {
 
     let server = connect_with_retry(&path, &mut child).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let reply_node = Node::new(ReplyHandler { tx }).expect("failed to build the reply node");
+    let (_reply_node, reply_node_ref) = Node::new(ReplyHandler { tx }).expect("failed to build the reply node");
 
     let mut buf = vec![0x41u8; payload];
     let mut seq = 0u64;
@@ -278,7 +278,7 @@ async fn parent_main(args: Vec<String>) {
     let make = |payload: &[u8], caps: usize| {
         let mut m = Message::from_data(payload.to_vec());
         for _ in 0..caps {
-            m.add_ref(reply_node.get_ref());
+            m.add_ref(&reply_node_ref);
         }
         m
     };
@@ -394,7 +394,7 @@ async fn parent_main(args: Vec<String>) {
 
     let mut m = Message::from_data(b"QUIT".to_vec());
     for _ in 0..caps {
-        m.add_ref(reply_node.get_ref());
+        m.add_ref(&reply_node_ref);
     }
     let _ = server.try_send(m);
     tokio::time::sleep(Duration::from_millis(100)).await;

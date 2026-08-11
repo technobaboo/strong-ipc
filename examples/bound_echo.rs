@@ -33,10 +33,10 @@ pub async fn main() {
     let echo_ref = Ref::connect(&path).await.unwrap();
 
     let finished_token = CancellationToken::new();
-    let reply_node = Node::new(EchoReplyHandler(finished_token.clone())).unwrap();
+    let (_reply_node, reply_node_ref) = Node::new(EchoReplyHandler(finished_token.clone())).unwrap();
 
     let mut message = Message::from_data("test".to_string().into_bytes());
-    message.add_ref(reply_node.get_ref());
+    message.add_ref(&reply_node_ref);
     echo_ref.try_send(message).unwrap();
 
     tokio::time::timeout(Duration::from_secs(30), finished_token.cancelled())

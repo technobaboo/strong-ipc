@@ -362,7 +362,7 @@ async fn parent_main(args: Vec<String>) {
 
     let server = connect_with_retry(&path, &mut child).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let reply_node = Node::new(ReplyHandler { tx }).expect("failed to build the reply node");
+    let (_reply_node, reply_node_ref) = Node::new(ReplyHandler { tx }).expect("failed to build the reply node");
 
     // the floor: same two processes, same kernel primitive, none of the library
     let raw_sock = if cfg.raw {
@@ -385,7 +385,7 @@ async fn parent_main(args: Vec<String>) {
     let make = |payload: &[u8], caps: usize| {
         let mut m = Message::from_data(payload.to_vec());
         for _ in 0..caps {
-            m.add_ref(reply_node.get_ref());
+            m.add_ref(&reply_node_ref);
         }
         m
     };

@@ -365,7 +365,7 @@ async fn rung_tokio_raw(
 /// server whether to promote the descriptor
 async fn rung_strong_ipc(
     server: &Ref,
-    reply_node: &Node<ReplyHandler>,
+    reply_node_ref: &Ref,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
     payload: usize,
     op: u8,
@@ -377,7 +377,7 @@ async fn rung_strong_ipc(
     let send = async |server: &Ref| {
         let mut m = Message::from_data(data.clone());
         if attach_fd {
-            m.add_ref(reply_node.get_ref());
+            m.add_ref(reply_node_ref);
         }
         server.send(m).await.expect("server closed");
     };
@@ -507,13 +507,13 @@ async fn async_main(_args: Vec<String>, kernel_fd_cost: Vec<f64>) {
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let reply_node = Node::new(ReplyHandler(tx)).unwrap();
+    let (_reply_node, reply_node_ref) = Node::new(ReplyHandler(tx)).unwrap();
 
     // hand the server a reply capability once, so the later rows have somewhere to
     // answer without needing to build a Ref
     {
         let mut m = Message::from_data(vec![OP_ESTABLISH; 8]);
-        m.add_ref(reply_node.get_ref());
+        m.add_ref(&reply_node_ref);
         server.try_send(m).unwrap();
         rx.recv().await;
     }
@@ -524,10 +524,10 @@ async fn async_main(_args: Vec<String>, kernel_fd_cost: Vec<f64>) {
         "payload", "no fd p50", "mean", "fd drop", "mean", "fd→Ref", "mean", "Ref costs"
     );
     for payload in PAYLOADS {
-        let none = rung_strong_ipc(&server, &reply_node, &mut rx, payload, OP_DROP_FD, false).await;
-        let drop_ = rung_strong_ipc(&server, &reply_node, &mut rx, payload, OP_DROP_FD, true).await;
+        let none = rung_strong_ipc(&server, &reply_node_ref, &mut rx, payload, OP_DROP_FD, false).await;
+        let drop_ = rung_strong_ipc(&server, &reply_node_ref, &mut rx, payload, OP_DROP_FD, true).await;
         let mkref =
-            rung_strong_ipc(&server, &reply_node, &mut rx, payload, OP_MAKE_REF, true).await;
+            rung_strong_ipc(&server, &reply_node_ref, &mut rx, payload, OP_MAKE_REF, true).await;
         println!(
             "  {:>8}  {:>9.2} {:>9.2}   {:>9.2} {:>9.2}   {:>9.2} {:>9.2}   {:>+9.2}",
             payload,
@@ -545,13 +545,13 @@ async fn async_main(_args: Vec<String>, kernel_fd_cost: Vec<f64>) {
     {
         let k0 = rung_raw_syscall(8, false).0.p50;
         let t0 = rung_tokio_raw(&raw_sock, &spare, 8, false).await.p50;
-        let s_none = rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_DROP_FD, false)
+        let s_none = rung_strong_ipc(&server, &reply_node_ref, &mut rx, 8, OP_DROP_FD, false)
             .await
             .p50;
-        let s_drop = rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_DROP_FD, true)
+        let s_drop = rung_strong_ipc(&server, &reply_node_ref, &mut rx, 8, OP_DROP_FD, true)
             .await
             .p50;
-        let s_ref = rung_strong_ipc(&server, &reply_node, &mut rx, 8, OP_MAKE_REF, true)
+        let s_ref = rung_strong_ipc(&server, &reply_node_ref, &mut rx, 8, OP_MAKE_REF, true)
             .await
             .p50;
         println!("  kernel round trip, no fd                {k0:>7.2} µs");

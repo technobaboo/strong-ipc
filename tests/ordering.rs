@@ -67,10 +67,10 @@ async fn strict_ordering_across_the_fast_path_boundary() {
         fds_seen: AtomicU64::new(0),
         payload_corrupt: AtomicU64::new(0),
     });
-    let node = Node::new_raw(checker.clone()).unwrap();
-    let target = node.get_ref().clone();
+    let (_node, node_ref) = Node::new_raw(checker.clone()).unwrap();
+    let target = node_ref.clone();
     // a second node just to have a capability worth attaching to every message
-    let cap_node = Node::new(NullHandler).unwrap();
+    let (_cap_node, cap_node_ref) = Node::new(NullHandler).unwrap();
 
     let mut queue_full = 0u64;
     for seq in 0..MESSAGES {
@@ -79,7 +79,7 @@ async fn strict_ordering_across_the_fast_path_boundary() {
         data[..4].copy_from_slice(&seq.to_le_bytes());
 
         let mut message = Message::from_data(data);
-        message.add_ref(cap_node.get_ref());
+        message.add_ref(&cap_node_ref);
 
         loop {
             match target.try_send(message) {

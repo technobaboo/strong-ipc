@@ -34,12 +34,12 @@ impl Handler for Gated {
 async fn a_full_queue_is_reported_as_full_never_as_closed() {
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let node = Node::new(Gated {
+    let (_node, node_ref) = Node::new(Gated {
         gate: gate_rx,
         seen: seen.clone(),
     })
     .unwrap();
-    let target = node.get_ref().clone();
+    let target = node_ref.clone();
 
     // no yields in this loop on purpose — yielding would let the drain task empty the
     // queue and we would never reach the state under test

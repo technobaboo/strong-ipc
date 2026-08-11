@@ -4,17 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rustix = { version = "1.1.4", features = ["net"] }
+# `event` is only for the zero-timeout `ppoll` behind `Ref::is_dead` — asking the kernel
+# whether a socket's peer is gone without registering it with the reactor
+rustix = { version = "1.1.4", features = ["net", "event"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
 # `net` is what provides tokio::io::unix::AsyncFd, which the outbox and the receive
-# loop use to wait on socket readiness
-tokio = { version = "1.53.1", features = ["rt", "net"] }
+# loop use to wait on socket readiness; `sync` is the mpsc behind the outbox and the
+# Notify behind death notifications
+tokio = { version = "1.53.1", features = ["rt", "net", "sync"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "signal", "time"] }
 # `process` only, for the credentials test to name its own uid/gid; the library needs `net`
-rustix = { version = "1.1.4", features = ["net", "process"] }
+rustix = { version = "1.1.4", features = ["net", "event", "process"] }
 # the benchmark harnesses measure strong-ipc against a bare seqpacket floor, so they
 # need a second implementation to compare against. the library itself uses neither.
 tokio-seqpacket = { version = "0.9.0", features = ["non-portable"] }

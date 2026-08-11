@@ -23,12 +23,12 @@ impl Handler for EchoReplyHandler {
 #[tokio::main(flavor = "current_thread")]
 pub async fn main() {
     let finished_token = CancellationToken::new();
-    let reply_node = Node::new(EchoReplyHandler(finished_token.clone())).unwrap();
-    let echo_node = Node::new(EchoHandler).unwrap();
+    let (_reply_node, reply_node_ref) = Node::new(EchoReplyHandler(finished_token.clone())).unwrap();
+    let (_echo_node, echo_node_ref) = Node::new(EchoHandler).unwrap();
 
     let mut message = Message::from_data("test".to_string().into_bytes());
-    message.add_ref(reply_node.get_ref());
-    echo_node.get_ref().try_send(message).unwrap();
+    message.add_ref(&reply_node_ref);
+    echo_node_ref.try_send(message).unwrap();
     tokio::time::timeout(Duration::from_secs(30), finished_token.cancelled())
         .await
         .unwrap();

@@ -327,7 +327,10 @@ impl Meter {
 
 struct Client {
     server: Ref,
-    reply_node: Node<ReplyHandler>,
+    /// kept alive so the reply node's socket stays up; the ref beside it is the
+    /// capability the server actually answers on
+    _reply_node: Node<ReplyHandler>,
+    reply_node_ref: Ref,
     rx: tokio::sync::mpsc::UnboundedReceiver<usize>,
     received: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
@@ -376,7 +379,7 @@ impl Client {
     fn message(&self, payload: &[u8], with_cap: usize) -> Message {
         let mut m = Message::from_data(payload.to_vec());
         for _ in 0..with_cap {
-            m.add_ref(self.reply_node.get_ref());
+            m.add_ref(&self.reply_node_ref);
         }
         m
     }
@@ -565,7 +568,7 @@ async fn parent_main(args: Vec<String>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let received = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
-    let reply_node = Node::new(ReplyHandler {
+    let (reply_node, reply_node_ref) = Node::new(ReplyHandler {
         tx,
         received: received.clone(),
         bytes: bytes.clone(),
@@ -574,7 +577,8 @@ async fn parent_main(args: Vec<String>) {
 
     let mut client = Client {
         server,
-        reply_node,
+        _reply_node: reply_node,
+        reply_node_ref,
         rx,
         received,
         bytes,

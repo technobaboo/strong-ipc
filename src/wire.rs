@@ -12,6 +12,7 @@
 //! [`Ref`]: crate::Ref
 
 use crate::message::{FdVec, Message};
+use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::net::{
     self, AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
     SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
@@ -24,7 +25,7 @@ use std::{
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     path::Path,
 };
-use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, unix::AsyncFd};
 
 /// the kernel's `SCM_MAX_FD` — the most descriptors one `SCM_RIGHTS` block can carry
 pub const MAX_FDS: usize = 253;
@@ -239,6 +240,34 @@ pub(crate) fn enable_credentials(fd: BorrowedFd<'_>) {
     let _ = net::sockopt::set_socket_passcred(fd, true);
 }
 
+/// is the far end of this connected socket gone?
+///
+/// one `ppoll` with a zero timeout — no reactor, no registration, no allocation, which
+/// is what lets a [`Ref`] answer this without giving up its unregistered fast path.
+///
+/// `POLLHUP` and `POLLERR` are reported whether or not you ask for them, so the requested
+/// event set is empty on purpose: this asks the kernel for the socket's *state*, not for
+/// readiness, and pending unread data never makes it say yes. When the peer of an
+/// `AF_UNIX` socket closes, the kernel sets our end's shutdown mask outright, which is
+/// what shows up here as `POLLHUP`; unread data still queued when it went turns into
+/// `ECONNRESET`, hence `POLLERR` too.
+///
+/// this is one-way — a socket that reports dead never comes back — so the answer does not
+/// go stale on you. False *negatives* are still possible for a moment: the peer may be
+/// closing as you ask.
+///
+/// [`Ref`]: crate::Ref
+pub(crate) fn is_hung_up(fd: BorrowedFd<'_>) -> bool {
+    let mut poll_fds = [PollFd::new(&fd, PollFlags::empty())];
+    match rustix::event::poll(&mut poll_fds, Some(&Timespec::default())) {
+        // a socket we cannot poll is not evidence of a dead peer, so say nothing
+        Err(_) => false,
+        Ok(_) => poll_fds[0]
+            .revents()
+            .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
+    }
+}
+
 /// a socket registered with the tokio reactor
 ///
 /// this is the piece that used to come from `tokio-seqpacket`. It is deliberately thin:
@@ -291,6 +320,28 @@ impl Reactive {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }
+        }
+    }
+
+    /// parks until the far end of this socket is gone
+    ///
+    /// `epoll` reports `EPOLLHUP`/`EPOLLERR` regardless of the interest mask, so a
+    /// hangup wakes this even though nothing is being read. Anything else that makes the
+    /// socket readable — a peer that talks back on what we only ever send on — is cleared
+    /// and waited on again, which is why this is a loop rather than a single `.await`.
+    ///
+    /// a reactor that reports an error is the runtime going away underneath us. There is
+    /// no way to keep watching after that, and hanging forever inside someone's `select!`
+    /// is the worse failure, so it reports death.
+    pub(crate) async fn hangup(&self) {
+        loop {
+            let Ok(mut guard) = self.io.ready(Interest::READABLE | Interest::ERROR).await else {
+                return;
+            };
+            if guard.ready().is_read_closed() || guard.ready().is_error() {
+                return;
+            }
+            guard.clear_ready();
         }
     }
 
