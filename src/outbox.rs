@@ -8,7 +8,11 @@
 //!
 //! [`Ref`]: crate::Ref
 
-use crate::{message::Message, wire::Reactive};
+use crate::{
+    error::{Closed, TrySendError},
+    message::Message,
+    wire::Reactive,
+};
 use std::{
     os::fd::OwnedFd,
     sync::{
@@ -16,7 +20,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::mpsc;
 
 /// how many messages may wait here before a sender is told to back off
 const DEPTH: usize = 8;
@@ -25,7 +29,7 @@ pub(crate) struct Outbox {
     sender: mpsc::Sender<Message>,
     /// messages handed to the drain task that aren't on the wire yet
     ///
-    /// gates the inline fast path in [`crate::Ref::send_message`]: while anything is
+    /// gates the inline fast path in [`crate::Ref::try_send`]: while anything is
     /// waiting, a message that skipped the queue would overtake it, so everyone queues
     /// until the backlog is gone. the task decrements only *after* its `sendmsg` returns,
     /// so the message it is holding mid-send still counts
@@ -47,7 +51,7 @@ impl Outbox {
         //
         // the `enter()` guard is load-bearing: registering with the reactor requires
         // runtime *context*, and holding a `Handle` is not the same thing. without it a
-        // `send_message` from a non-runtime thread panics with "there is no reactor
+        // `try_send` from a non-runtime thread panics with "there is no reactor
         // running" the moment its socket backs up
         let socket = {
             let _guard = runtime.enter();
@@ -71,9 +75,9 @@ impl Outbox {
         self.pending.load(Ordering::Acquire) != 0
     }
 
-    /// queue `message` behind whatever is already waiting
+    /// queue `message` behind whatever is already waiting, or give it straight back
     #[allow(clippy::result_large_err)]
-    pub(crate) fn push(&self, message: Message) -> Result<(), TrySendError<Message>> {
+    pub(crate) fn push(&self, message: Message) -> Result<(), TrySendError> {
         // claimed before the push so a concurrent fast path sees us coming and queues
         // behind us instead of jumping the line
         self.pending.fetch_add(1, Ordering::AcqRel);
@@ -81,9 +85,26 @@ impl Outbox {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.pending.fetch_sub(1, Ordering::AcqRel);
-                Err(e)
+                Err(match e {
+                    mpsc::error::TrySendError::Full(m) => TrySendError::Full(m),
+                    mpsc::error::TrySendError::Closed(m) => TrySendError::Closed(m),
+                })
             }
         }
+    }
+
+    /// queue `message`, waiting for room if the queue is full
+    ///
+    /// takes the slot *before* claiming it in `pending`, so the window between the claim
+    /// and the push stays as tight as [`Outbox::push`]'s. Incrementing first and then
+    /// awaiting would hold the inline fast path shut for the entire wait
+    pub(crate) async fn send(&self, message: Message) -> Result<(), Closed> {
+        let Ok(permit) = self.sender.reserve().await else {
+            return Err(Closed(message));
+        };
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        permit.send(message);
+        Ok(())
     }
 
     async fn drain(

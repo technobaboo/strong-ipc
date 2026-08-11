@@ -4,13 +4,12 @@
 //!   - the outbound drain task is deliberately **not** an `AbortOnDrop`, so dropping the
 //!     last `Ref` still drains whatever it already accepted
 //!   - `RefInner` captures a `runtime::Handle` at construction, because the outbox is
-//!     built from `send_message`, which is sync and may not be on a runtime thread
+//!     built from `try_send`, which is sync and may not be on a runtime thread
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
-use tokio::sync::mpsc::error::TrySendError;
+use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref, TrySendError};
 
 const PAYLOAD: usize = 4096;
 
@@ -64,7 +63,7 @@ async fn a_ref_outliving_its_node_reports_closed() {
 
     assert!(
         matches!(
-            orphan.send_message(Message::from_data(b"anyone there?".to_vec())),
+            orphan.try_send(Message::from_data(b"anyone there?".to_vec())),
             Err(TrySendError::Closed(_))
         ),
         "sending through a ref whose node is gone should report Closed"
@@ -93,7 +92,7 @@ async fn dropping_the_last_ref_still_drains_the_queue() {
     // fill the socket, then the queue, so there is a real backlog to lose
     let mut accepted = 0u32;
     for seq in 0..100_000u32 {
-        match client.send_message(numbered(seq)) {
+        match client.try_send(numbered(seq)) {
             Ok(()) => accepted += 1,
             Err(TrySendError::Full(_)) => break,
             Err(TrySendError::Closed(_)) => panic!("closed while filling"),
@@ -124,7 +123,7 @@ async fn dropping_the_last_ref_still_drains_the_queue() {
 
 /// the outbox can be built from a thread that is not a runtime thread
 ///
-/// `send_message` is sync, so nothing stops a caller invoking it off-runtime. Building the
+/// `try_send` is sync, so nothing stops a caller invoking it off-runtime. Building the
 /// outbox needs to spawn a task, which is why `RefInner` captures a `Handle` at
 /// construction rather than calling `Handle::current()` at use.
 ///
@@ -156,7 +155,7 @@ async fn the_outbox_can_be_built_from_a_non_runtime_thread() {
         );
         let mut accepted = 0u32;
         for seq in 0..100_000u32 {
-            match client.send_message(numbered(seq)) {
+            match client.try_send(numbered(seq)) {
                 Ok(()) => accepted += 1,
                 Err(TrySendError::Full(_)) => break,
                 Err(TrySendError::Closed(_)) => panic!("closed while filling off-runtime"),

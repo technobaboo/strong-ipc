@@ -47,7 +47,7 @@ async fn expect_count(counts: &[usize]) {
             message.add_fd(fd);
         }
         node.get_ref()
-            .send_message(message)
+            .try_send(message)
             .unwrap_or_else(|e| panic!("send of {n} descriptors failed: {e:?}"));
 
         let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -84,17 +84,7 @@ async fn received_descriptors_are_reclaimed() {
         for fd in descriptors(4) {
             message.add_fd(fd);
         }
-        let mut message = Some(message);
-        loop {
-            match node.get_ref().send_message(message.take().unwrap()) {
-                Ok(()) => break,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(m)) => {
-                    message = Some(m);
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => panic!("send failed: {e:?}"),
-            }
-        }
+        node.get_ref().send(message).await.expect("peer closed");
         let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
     }
     // let the last few drop

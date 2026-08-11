@@ -6,11 +6,19 @@
 //! descriptors in `SCM_RIGHTS`, so passing one is the same operation as passing a file.
 //!
 //! ```text
-//!   Message ──► Ref::send_message ──┬─► sendmsg inline          (the common case)
-//!                                   └─► Outbox ──► drain task   (only when backed up)
+//!   Message ──► Ref::send / try_send ──┬─► sendmsg inline        (the common case)
+//!                                      └─► Outbox ──► drain task (only when backed up)
 //!
 //!   socket ──► recv_loop ──► Handler::handle(data, fds, creds)
 //! ```
+//!
+//! [`Ref::send`] waits for room and so can only fail with [`Closed`]; [`Ref::try_send`]
+//! never blocks and reports [`TrySendError::Full`] when the socket and the outbound queue
+//! are both backed up. Both hand the [`Message`] back on failure, so a caller can retry
+//! with it rather than rebuilding it. Prefer `send` — spinning on `Full` is a busy-wait.
+//!
+//! `creds` is the kernel's word on who the peer is, not the peer's: `SO_PASSCRED` is set
+//! by the receiving side, so credentials cannot be forged or omitted by the sender.
 //!
 //! [`Node`] is a node on a socketpair, which you reach with the [`Ref`] it hands you.
 //! [`BoundNode`] listens on a filesystem path instead, because capabilities have a
@@ -20,7 +28,7 @@
 //!
 //! # Why sending and receiving don't look alike
 //!
-//! Sending has an inline fast path (`wire::try_send_now`) that goes straight to
+//! Sending has an inline fast path (`wire::send_now`) that goes straight to
 //! `sendmsg` with no reactor involvement, and only falls back to a queue when the socket
 //! is genuinely full. Receiving has no such thing, and that asymmetry is deliberate.
 //!
@@ -47,12 +55,14 @@
 #![forbid(unsafe_code)]
 
 mod capability;
+mod error;
 mod message;
 mod node;
 mod outbox;
 pub mod wire;
 
 pub use capability::Ref;
+pub use error::{Closed, TrySendError};
 pub use message::{FdVec, Message};
 pub use node::{BoundNode, Handler, Node};
 pub use wire::{EXPECTED_ANCILLARY_BUFFER_SIZE, MAX_FDS};
@@ -69,7 +79,7 @@ mod tests {
     use super::*;
 
     /// `Message` is moved by value on every send, including back out of a failed
-    /// `send_message`, so its inline descriptor storage has to stay small
+    /// `try_send`, so its inline descriptor storage has to stay small
     ///
     /// sizing the SmallVec by `MAX_FDS` instead of `EXPECTED_FDS` put roughly four
     /// kilobytes on the stack per message, which is what made clippy's `result_large_err`

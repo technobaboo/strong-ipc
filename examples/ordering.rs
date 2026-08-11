@@ -1,4 +1,4 @@
-//! correctness check for the inline fast path in `Ref::send_message`
+//! correctness check for the inline fast path in `Ref::try_send`
 //!
 //! the fast path lets a message skip the queue and go straight to the kernel. that is
 //! only sound if a message can never overtake one already waiting in the queue, so this
@@ -14,8 +14,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
-use strong_ipc::{FdVec, Handler, Message, Node};
-use tokio::sync::mpsc::error::TrySendError;
+use strong_ipc::{FdVec, Handler, Message, Node, TrySendError};
 
 const MESSAGES: u32 = 500_000;
 /// big enough that the socket buffer fills quickly and the queue path gets used
@@ -88,7 +87,7 @@ async fn main() {
         message.add_ref(cap_node.get_ref());
 
         loop {
-            match target.send_message(message) {
+            match target.try_send(message) {
                 Ok(()) => break,
                 Err(TrySendError::Full(m)) => {
                     // the queue backed up too — yield so the drain task and the receiver

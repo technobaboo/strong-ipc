@@ -3,7 +3,7 @@
 //! everything above this file is plain Rust moving [`Message`]s around; this is where one
 //! becomes bytes and descriptors on a socket, and the only place a syscall happens.
 //!
-//! there is exactly one implementation of "send a `Message`" — [`send_now`] — used both
+//! there is exactly one implementation of "send a `Message`" — `send_now` — used both
 //! by [`Ref`]'s inline fast path and by the outbox's drain task. That matters: when the
 //! two had separate implementations they silently diverged, disagreeing about `MSG_EOR`
 //! and about whether an fd-less message still carried an empty `SCM_RIGHTS` block.
@@ -36,7 +36,7 @@ pub const MAX_FDS: usize = 253;
 /// point past which those spill to the heap
 pub(crate) const EXPECTED_FDS: usize = 8;
 
-/// the send-side stack buffer: enough for [`EXPECTED_FDS`] descriptors plus credentials
+/// the send-side stack buffer: enough for `EXPECTED_FDS` (8) descriptors plus credentials
 pub const EXPECTED_ANCILLARY_BUFFER_SIZE: usize =
     rustix::cmsg_space!(ScmRights(EXPECTED_FDS), ScmCredentials(1));
 
@@ -211,6 +211,19 @@ pub(crate) fn accept_now(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
 /// the socket's receive buffer, which bounds the largest datagram it can ever deliver
 pub(crate) fn recv_buffer_limit(fd: BorrowedFd<'_>) -> usize {
     net::sockopt::socket_recv_buffer_size(fd).unwrap_or(INITIAL_RECV_BUFFER)
+}
+
+/// asks the kernel to stamp every incoming message with the sender's credentials
+///
+/// `SO_PASSCRED` is set by the *receiver*, and the kernel then attaches `SCM_CREDENTIALS`
+/// to everything arriving on the socket — the sender does nothing and cannot opt out or
+/// forge them. That is what makes the credentials worth having: they are the kernel's
+/// word, not the peer's.
+///
+/// best-effort: a socket that refuses the option simply reports `None` credentials rather
+/// than failing to receive
+pub(crate) fn enable_credentials(fd: BorrowedFd<'_>) {
+    let _ = net::sockopt::set_socket_passcred(fd, true);
 }
 
 /// a socket registered with the tokio reactor

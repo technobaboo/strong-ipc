@@ -28,7 +28,6 @@ use std::{
     time::{Duration, Instant},
 };
 use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
-use tokio::sync::mpsc::error::TrySendError;
 
 const ITERS: usize = 50_000;
 const WARMUP: usize = 5_000;
@@ -261,17 +260,7 @@ impl Handler for EchoHandler {
             }
         };
 
-        let mut message = Message::from_data(data.to_vec());
-        loop {
-            match reply.send_message(message) {
-                Ok(()) => break,
-                Err(TrySendError::Full(m)) => {
-                    message = m;
-                    tokio::task::yield_now().await;
-                }
-                Err(TrySendError::Closed(_)) => break,
-            }
-        }
+        let _ = reply.send(Message::from_data(data.to_vec())).await;
     }
 }
 
@@ -390,17 +379,7 @@ async fn rung_strong_ipc(
         if attach_fd {
             m.add_ref(reply_node.get_ref());
         }
-        let mut m = Some(m);
-        loop {
-            match server.send_message(m.take().unwrap()) {
-                Ok(()) => return,
-                Err(TrySendError::Full(x)) => {
-                    m = Some(x);
-                    tokio::task::yield_now().await;
-                }
-                Err(TrySendError::Closed(_)) => panic!("server closed"),
-            }
-        }
+        server.send(m).await.expect("server closed");
     };
 
     for _ in 0..WARMUP {
@@ -535,7 +514,7 @@ async fn async_main(_args: Vec<String>, kernel_fd_cost: Vec<f64>) {
     {
         let mut m = Message::from_data(vec![OP_ESTABLISH; 8]);
         m.add_ref(reply_node.get_ref());
-        server.send_message(m).unwrap();
+        server.try_send(m).unwrap();
         rx.recv().await;
     }
 
@@ -599,7 +578,7 @@ async fn async_main(_args: Vec<String>, kernel_fd_cost: Vec<f64>) {
         );
     }
 
-    let _ = server.send_message(Message::from_data(b"QUIT".to_vec()));
+    let _ = server.try_send(Message::from_data(b"QUIT".to_vec()));
     tokio::time::sleep(Duration::from_millis(200)).await;
     let _ = child.kill();
     let _ = child.wait();

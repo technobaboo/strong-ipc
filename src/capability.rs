@@ -1,18 +1,22 @@
 //! `Ref` — a sending capability, and the two-tier send that keeps it cheap
 
-use crate::{message::Message, outbox::Outbox, wire};
+use crate::{
+    error::{Closed, TrySendError},
+    message::Message,
+    outbox::Outbox,
+    wire,
+};
 use std::{
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     path::Path,
     sync::{Arc, OnceLock},
 };
-use tokio::sync::mpsc::error::TrySendError;
 
 struct RefInner {
     /// the socket, deliberately *not* registered with the reactor — every inline send is
     /// a bare `sendmsg` on this, which needs no readiness tracking at all
     fd: OwnedFd,
-    /// captured at construction, since the outbox is built from `send_message`, which is
+    /// captured at construction, since the outbox is built from `try_send`, which is
     /// sync and may not be running on a runtime thread
     runtime: Option<tokio::runtime::Handle>,
     outbox: OnceLock<Outbox>,
@@ -77,18 +81,44 @@ impl Ref {
         self.inner.fd.as_fd()
     }
 
+    /// hands `message` to the peer, waiting for room if there is none
+    ///
+    /// takes the same inline fast path as [`Ref::try_send`], and only parks if the
+    /// socket *and* the outbound queue are both full. Because it waits out backpressure,
+    /// the only thing it can report is a peer that is actually gone.
+    ///
+    /// this is what you want unless you have something better to do than wait. Ordering
+    /// is preserved for any one sender: a caller awaiting here cannot have another send
+    /// of its own in flight to overtake it.
+    pub async fn send(&self, message: Message) -> Result<(), Closed> {
+        let message = match self.try_send(message) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Closed(m)) => return Err(Closed(m)),
+            Err(TrySendError::Full(m)) => m,
+        };
+        // `try_send` only reports `Full` once the outbox exists, so this cannot be the
+        // call that has to build it — but handle the failure rather than assuming
+        let Ok(outbox) = self.inner.outbox() else {
+            return Err(Closed(message));
+        };
+        outbox.send(message).await
+    }
+
     /// hands `message` to the peer without ever blocking the caller
     ///
     /// tries the syscall inline first, so in the common case there is no channel, no
     /// task wakeup and no scheduler hop. only a socket that is genuinely backed up falls
-    /// through to the queue, and only a full queue gives `Full` back
+    /// through to the queue, and only a full queue gives `Full` back.
+    ///
+    /// prefer [`Ref::send`] unless you genuinely cannot wait — a caller that spins on
+    /// `Full` is busy-waiting, where `send` parks until there is room.
     ///
     /// the error carries the `Message` back so a caller that hit backpressure can retry
     /// with it rather than losing it. that makes the `Err` variant 176 bytes, past
     /// clippy's 128-byte comfort line — but boxing it would put a heap allocation on
     /// exactly the path that is already under pressure, which is the wrong trade
     #[allow(clippy::result_large_err)]
-    pub fn send_message(&self, message: Message) -> Result<(), TrySendError<Message>> {
+    pub fn try_send(&self, message: Message) -> Result<(), TrySendError> {
         // a backlog can only exist if something already built the outbox, so an untouched
         // ref answers this with one relaxed load and no indirection
         let backed_up = self.inner.outbox.get().is_some_and(Outbox::is_backed_up);

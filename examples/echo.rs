@@ -8,7 +8,7 @@ impl Handler for EchoHandler {
         let return_fd = fds.into_iter().next().unwrap();
         let return_ref = Ref::from_owned_fd(return_fd);
         return_ref
-            .send_message(Message::from_data(data.to_vec()))
+            .try_send(Message::from_data(data.to_vec()))
             .unwrap();
     }
 }
@@ -28,7 +28,7 @@ pub async fn main() {
 
     let mut message = Message::from_data("test".to_string().into_bytes());
     message.add_ref(reply_node.get_ref());
-    echo_node.get_ref().send_message(message).unwrap();
+    echo_node.get_ref().try_send(message).unwrap();
     tokio::time::timeout(Duration::from_secs(30), finished_token.cancelled())
         .await
         .unwrap();

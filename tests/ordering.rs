@@ -1,6 +1,6 @@
 //! strict ordering across the inline-fast-path / queue boundary
 //!
-//! `Ref::send_message` lets a message skip the outbound queue and go straight to the
+//! `Ref::try_send` lets a message skip the outbound queue and go straight to the
 //! kernel. that is only sound if a message can never overtake one already waiting in the
 //! queue, so this deliberately drives the socket into backpressure: the sender outruns the
 //! receiver, the buffer fills, sends start falling back to the queue, then the buffer
@@ -15,8 +15,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
-use strong_ipc::{FdVec, Handler, Message, Node};
-use tokio::sync::mpsc::error::TrySendError;
+use strong_ipc::{FdVec, Handler, Message, Node, TrySendError};
 
 const MESSAGES: u32 = 50_000;
 /// big enough that the socket buffer fills quickly and the queue path gets used
@@ -83,7 +82,7 @@ async fn strict_ordering_across_the_fast_path_boundary() {
         message.add_ref(cap_node.get_ref());
 
         loop {
-            match target.send_message(message) {
+            match target.try_send(message) {
                 Ok(()) => break,
                 Err(TrySendError::Full(m)) => {
                     message = m;

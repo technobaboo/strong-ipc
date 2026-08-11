@@ -42,7 +42,7 @@ pub async fn main() {
     println!("sending {text:?}");
     let mut message = Message::from_data(text.into_bytes());
     message.add_ref(reply_node.get_ref());
-    server.send_message(message).unwrap();
+    server.try_send(message).unwrap();
 
     tokio::time::timeout(Duration::from_secs(10), done.cancelled())
         .await

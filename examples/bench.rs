@@ -22,8 +22,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
-use tokio::sync::mpsc::error::TrySendError;
+use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref, TrySendError};
 
 /// stop the run once either side is using this much of its descriptor budget
 const FD_WARN_FRACTION: f64 = 0.80;
@@ -206,17 +205,7 @@ impl Handler for EchoHandler {
         // the descriptors the kernel duped into us
         drop(fds);
 
-        let mut message = Message::from_data(data.to_vec());
-        loop {
-            match reply.send_message(message) {
-                Ok(()) => break,
-                Err(TrySendError::Full(m)) => {
-                    message = m;
-                    tokio::task::yield_now().await;
-                }
-                Err(TrySendError::Closed(_)) => break,
-            }
-        }
+        let _ = reply.send(Message::from_data(data.to_vec())).await;
     }
 }
 
@@ -348,22 +337,20 @@ struct Client {
 }
 
 impl Client {
-    /// pushes one message, retrying while the ref's outbound queue is full
+    /// pushes one message, waiting if the ref's outbound queue is full
     ///
-    /// `Ref::send_message` is a `try_send` on a channel of 8, so a sender that outpaces
-    /// the socket has nowhere to park — spinning here is the only option the api gives
-    /// us, and the retry count is worth reporting on its own
-    async fn send(&self, mut message: Message, retries: &mut u64) -> bool {
-        loop {
-            match self.server.send_message(message) {
-                Ok(()) => return true,
-                Err(TrySendError::Full(m)) => {
-                    message = m;
-                    *retries += 1;
-                    self.watch.sample();
-                    tokio::task::yield_now().await;
-                }
-                Err(TrySendError::Closed(_)) => return false,
+    /// tries the non-blocking path first purely so backpressure can be *counted*: a
+    /// `Full` here means this send found the socket and the 8-slot queue both full. It
+    /// then parks on `send` rather than spinning, so a squeezed sender costs a wakeup
+    /// instead of a core
+    async fn send(&self, message: Message, backpressured: &mut u64) -> bool {
+        match self.server.try_send(message) {
+            Ok(()) => true,
+            Err(TrySendError::Closed(_)) => false,
+            Err(TrySendError::Full(m)) => {
+                *backpressured += 1;
+                self.watch.sample();
+                self.server.send(m).await.is_ok()
             }
         }
     }
@@ -764,7 +751,8 @@ async fn parent_main(args: Vec<String>) {
             );
         }
     }
-    println!("  'backpres' is the share of sends that found the ref's 8-slot queue full and spun.");
+    println!("  'backpres' is the share of sends that found the socket and the ref's 8-slot");
+    println!("  queue both full, and had to wait for room.");
 
     // ---- descriptor churn under sustained capability passing
     header("descriptor churn — 30 s of capability passing at full rate");

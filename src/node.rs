@@ -8,6 +8,7 @@ use crate::{
 use rustix::net::UCred;
 use std::{
     mem::MaybeUninit,
+    os::fd::AsFd,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -34,6 +35,7 @@ impl<H: Handler> Node<H> {
     }
     pub fn new_raw(handler: Arc<H>) -> std::io::Result<Node<H>> {
         let (tx, rx) = wire::socketpair()?;
+        wire::enable_credentials(rx.as_fd());
         let task = tokio::spawn(recv_loop(handler.clone(), Reactive::new(rx)?));
         Ok(Self {
             handler,
@@ -142,6 +144,8 @@ impl<H: Handler> BoundNode<H> {
         let mut connections = JoinSet::new();
         loop {
             let fd = listener.accept().await?;
+            // set per connection: SO_PASSCRED is not inherited from the listener
+            wire::enable_credentials(fd.as_fd());
             // clear out whoever hung up since, so this doesn't grow forever
             while connections.try_join_next().is_some() {}
             connections.spawn(recv_loop(handler.clone(), Reactive::new(fd)?));

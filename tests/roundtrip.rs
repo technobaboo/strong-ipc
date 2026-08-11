@@ -3,8 +3,7 @@
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
-use strong_ipc::{FdVec, Handler, Message, Node, Ref};
-use tokio::sync::mpsc::error::TrySendError;
+use strong_ipc::{FdVec, Handler, Message, Node, Ref, TrySendError};
 
 /// hands every received message straight back to the test
 struct Collector {
@@ -42,7 +41,7 @@ async fn payloads_arrive_intact() {
     for len in [1usize, 2, 64, 512, 4096, 8191, 8192] {
         let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         node.get_ref()
-            .send_message(Message::from_data(payload.clone()))
+            .try_send(Message::from_data(payload.clone()))
             .unwrap();
         let (got, fds) = next(&mut rx).await;
         assert_eq!(got.len(), len, "wrong length for a {len} B payload");
@@ -62,7 +61,7 @@ async fn zero_length_message_looks_like_a_hangup() {
     let (node, mut rx) = collector();
 
     node.get_ref()
-        .send_message(Message::from_data(Vec::new()))
+        .try_send(Message::from_data(Vec::new()))
         .unwrap();
     // nothing is delivered to the handler
     assert!(
@@ -76,7 +75,7 @@ async fn zero_length_message_looks_like_a_hangup() {
     assert!(
         matches!(
             node.get_ref()
-                .send_message(Message::from_data(b"after".to_vec())),
+                .try_send(Message::from_data(b"after".to_vec())),
             Err(TrySendError::Closed(_))
         ),
         "the recv loop survived a zero-length message, or the sender was not told"
@@ -91,7 +90,7 @@ impl Handler for Echo {
             return;
         };
         let reply = Ref::from_owned_fd(fd);
-        let _ = reply.send_message(Message::from_data(data.to_vec()));
+        let _ = reply.try_send(Message::from_data(data.to_vec()));
     }
 }
 
@@ -102,7 +101,7 @@ async fn reply_travels_back_over_an_attached_capability() {
 
     let mut message = Message::from_data(b"ping".to_vec());
     message.add_ref(mine.get_ref());
-    echo.get_ref().send_message(message).unwrap();
+    echo.get_ref().try_send(message).unwrap();
 
     let (got, _) = next(&mut rx).await;
     assert_eq!(got, b"ping");
@@ -117,7 +116,7 @@ async fn a_forwarded_descriptor_is_usable_on_the_far_side() {
     let (node, mut rx) = collector();
     let mut message = Message::from_data(b"here is a file".to_vec());
     message.add_fd(OwnedFd::from(file));
-    node.get_ref().send_message(message).unwrap();
+    node.get_ref().try_send(message).unwrap();
 
     let (got, fds) = next(&mut rx).await;
     assert_eq!(got, b"here is a file");
@@ -130,4 +129,44 @@ async fn a_forwarded_descriptor_is_usable_on_the_far_side() {
     assert_eq!(contents, "capability payload");
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// the kernel stamps every message with the sender's real credentials
+///
+/// `SO_PASSCRED` is set by the receiver, so credentials arrive whether or not the sender
+/// asks — and cannot be forged by it. Before this was wired up the `creds` argument was
+/// always `None`, which made it a parameter every `Handler` had to write and nobody could
+/// use.
+struct Creds {
+    tx: tokio::sync::mpsc::UnboundedSender<Option<strong_ipc::UCred>>,
+}
+impl Handler for Creds {
+    async fn handle(&self, _d: &mut [u8], _f: FdVec, creds: Option<strong_ipc::UCred>) {
+        let _ = self.tx.send(creds);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messages_arrive_stamped_with_peer_credentials() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = Node::new(Creds { tx }).unwrap();
+
+    node.get_ref()
+        .send(Message::from_data(b"who am i".to_vec()))
+        .await
+        .expect("peer closed");
+
+    let creds = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out")
+        .expect("channel closed")
+        .expect("no credentials on the message — is SO_PASSCRED set on the receiver?");
+
+    assert_eq!(
+        creds.pid.as_raw_nonzero().get() as u32,
+        std::process::id(),
+        "credentials named a different process"
+    );
+    assert_eq!(creds.uid.as_raw(), rustix::process::getuid().as_raw());
+    assert_eq!(creds.gid.as_raw(), rustix::process::getgid().as_raw());
 }

@@ -32,7 +32,6 @@ use std::{
     time::{Duration, Instant},
 };
 use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
-use tokio::sync::mpsc::error::TrySendError;
 
 /// recv_loop's read buffer in lib.rs; payloads above this get truncated by the kernel
 const MAX_PAYLOAD: usize = 8192;
@@ -109,17 +108,7 @@ impl Handler for EchoHandler {
         // extra capabilities drop here, which closes the descriptors the kernel duped in
         drop(fds);
 
-        let mut message = Message::from_data(data.to_vec());
-        loop {
-            match reply.send_message(message) {
-                Ok(()) => break,
-                Err(TrySendError::Full(m)) => {
-                    message = m;
-                    tokio::task::yield_now().await;
-                }
-                Err(TrySendError::Closed(_)) => break,
-            }
-        }
+        let _ = reply.send(Message::from_data(data.to_vec())).await;
     }
 }
 
@@ -401,20 +390,8 @@ async fn parent_main(args: Vec<String>) {
         m
     };
 
-    // send one message, spinning while the ref's 8-slot queue is full
-    let push = |m: Message| async {
-        let mut m = m;
-        loop {
-            match server.send_message(m) {
-                Ok(()) => return true,
-                Err(TrySendError::Full(back)) => {
-                    m = back;
-                    tokio::task::yield_now().await;
-                }
-                Err(TrySendError::Closed(_)) => return false,
-            }
-        }
-    };
+    // send one message, waiting if the ref's 8-slot queue is full
+    let push = |m: Message| async { server.send(m).await.is_ok() };
 
     // ---- warmup: fault in pages, and hand the server a reply ref so caps=0 can work
     for _ in 0..200 {

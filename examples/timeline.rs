@@ -15,10 +15,10 @@
 //!   t0 ──► t0b ─────────► t1 ─────► t2 ─────────────► t3
 //!   │      │              │         │                 │
 //!   │      │              │         │                 client ReplyHandler entry
-//!   │      │              │         server, just before send_message
+//!   │      │              │         server, just before try_send
 //!   │      │              server, Handler::handle entry
-//!   │      client, just after send_message returned
-//!   client, just before send_message
+//!   │      client, just after try_send returned
+//!   client, just before try_send
 //! ```
 //!
 //! which cuts the round trip into four sections that sum to the whole:
@@ -53,7 +53,6 @@ use std::{
     time::{Duration, Instant},
 };
 use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
-use tokio::sync::mpsc::error::TrySendError;
 
 /// recv_loop's read buffer in lib.rs; payloads above this get truncated by the kernel
 const MAX_PAYLOAD: usize = 8192;
@@ -125,17 +124,7 @@ impl Handler for EchoHandler {
         // last thing before handing it back, so section C is handler work and nothing else
         put(&mut out, 2, now_ns());
 
-        let mut message = Message::from_data(out);
-        loop {
-            match reply.send_message(message) {
-                Ok(()) => break,
-                Err(TrySendError::Full(m)) => {
-                    message = m;
-                    tokio::task::yield_now().await;
-                }
-                Err(TrySendError::Closed(_)) => break,
-            }
-        }
+        let _ = reply.send(Message::from_data(out)).await;
     }
 }
 
@@ -297,11 +286,7 @@ async fn parent_main(args: Vec<String>) {
     // ---- warmup: fault in pages, and hand the server a reply ref so caps=0 can work
     for _ in 0..500 {
         put(&mut buf, 0, seq);
-        let mut m = make(&buf, caps.max(1));
-        while let Err(TrySendError::Full(back)) = server.send_message(m) {
-            m = back;
-            tokio::task::yield_now().await;
-        }
+        let _ = server.send(make(&buf, caps.max(1))).await;
         let _ = tokio::time::timeout(REPLY_TIMEOUT, rx.recv()).await;
         seq += 1;
     }
@@ -328,21 +313,7 @@ async fn parent_main(args: Vec<String>) {
             put(&mut buf, 0, seq);
 
             let t0 = now_ns();
-            let mut m = make(&buf, caps);
-            let mut ok = true;
-            loop {
-                match server.send_message(m) {
-                    Ok(()) => break,
-                    Err(TrySendError::Full(back)) => {
-                        m = back;
-                        tokio::task::yield_now().await;
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
+            let ok = server.send(make(&buf, caps)).await.is_ok();
             if !ok {
                 break;
             }
@@ -425,7 +396,7 @@ async fn parent_main(args: Vec<String>) {
     for _ in 0..caps {
         m.add_ref(reply_node.get_ref());
     }
-    let _ = server.send_message(m);
+    let _ = server.try_send(m);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = child.kill();
     let _ = child.wait();

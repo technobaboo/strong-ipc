@@ -27,7 +27,7 @@ impl Handler for Echo {
         let reply = Ref::from_owned_fd(fd);
         let mut out = self.tag.as_bytes().to_vec();
         out.extend_from_slice(data);
-        let _ = reply.send_message(Message::from_data(out));
+        let _ = reply.try_send(Message::from_data(out));
     }
 }
 
@@ -55,7 +55,7 @@ async fn connect_and_echo_over_a_bound_socket() {
 
     let mut message = Message::from_data(b"knock".to_vec());
     message.add_ref(mine.get_ref());
-    server_ref.send_message(message).unwrap();
+    server_ref.try_send(message).unwrap();
 
     let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -110,7 +110,7 @@ async fn concurrent_clients_share_one_handler() {
     for (r, body) in [(&a, &b"one"[..]), (&b, &b"two"[..])] {
         let mut m = Message::from_data(body.to_vec());
         m.add_ref(mine.get_ref());
-        r.send_message(m).unwrap();
+        r.try_send(m).unwrap();
     }
 
     let mut got = Vec::new();

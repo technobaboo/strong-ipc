@@ -1,14 +1,13 @@
 //! what a sender that outruns its receiver actually sees
 //!
 //! the contract is that a `Ref` never blocks its caller: once the socket buffer and the
-//! outbound queue are both full, `send_message` hands the message back as
+//! outbound queue are both full, `try_send` hands the message back as
 //! `TrySendError::Full` rather than parking. A full queue must never be mistaken for a
 //! dead peer, and nothing already accepted may be lost or reordered by the squeeze.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use strong_ipc::{FdVec, Handler, Message, Node};
-use tokio::sync::mpsc::error::TrySendError;
+use strong_ipc::{FdVec, Handler, Message, Node, TrySendError};
 
 const PAYLOAD: usize = 4096;
 
@@ -49,7 +48,7 @@ async fn a_full_queue_is_reported_as_full_never_as_closed() {
     for seq in 0..100_000u32 {
         let mut data = vec![0xABu8; PAYLOAD];
         data[..4].copy_from_slice(&seq.to_le_bytes());
-        match target.send_message(Message::from_data(data)) {
+        match target.try_send(Message::from_data(data)) {
             Ok(()) => accepted += 1,
             Err(TrySendError::Full(returned)) => {
                 rejected = Some(returned);
@@ -63,22 +62,14 @@ async fn a_full_queue_is_reported_as_full_never_as_closed() {
 
     // the message handed back by `Full` must still be usable — that is the whole point of
     // returning it rather than dropping it
-    let mut rejected =
+    let rejected =
         rejected.expect("the queue never filled, so backpressure was never exercised");
     assert!(accepted > 0, "nothing was accepted at all");
 
-    // open the gate and let everything land, retrying the one that bounced
+    // open the gate and let everything land, retrying the one that bounced — `send`
+    // waits for room rather than spinning, which is the whole reason it exists
     gate_tx.send(true).unwrap();
-    loop {
-        match target.send_message(rejected) {
-            Ok(()) => break,
-            Err(TrySendError::Full(m)) => {
-                rejected = m;
-                tokio::task::yield_now().await;
-            }
-            Err(TrySendError::Closed(_)) => panic!("peer closed while retrying"),
-        }
-    }
+    target.send(rejected).await.expect("peer closed while retrying");
     let total = accepted + 1;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
