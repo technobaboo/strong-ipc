@@ -3,7 +3,7 @@
 use crate::{
     Ref,
     message::FdVec,
-    wire::{self, INITIAL_RECV_BUFFER, MAX_ANCILLARY_BUFFER_SIZE, Reactive},
+    wire::{self, MAX_ANCILLARY_BUFFER_SIZE, MAX_MESSAGE_SIZE, Reactive},
 };
 use rustix::net::UCred;
 use std::{
@@ -63,32 +63,31 @@ impl<H: Handler> Node<H> {
 /// to feed a handler. `Ok` means the peer hung up, not an error, though that's just a
 /// zero-length read, same as an empty message, so sending one looks like a disconnect.
 ///
-/// the payload buffer starts small and grows to whatever peers actually send, and no
-/// message is ever lost to it being too small: each datagram's length is peeked before it
-/// is consumed, so the buffer is already big enough by the time anything is read. The
-/// control buffer needs no such treatment — it is sized for `MAX_FDS` up front, because a
-/// truncated control message means the kernel dropped descriptors, and a silently dropped
-/// descriptor is a capability that vanished
+/// both buffers are fixed and neither can be overrun by a peer using this crate:
+/// [`MAX_MESSAGE_SIZE`] is refused at send, and the control buffer is sized for
+/// `MAX_FDS`. That is what makes the receive path one syscall with no size probe in
+/// front of it, and what keeps the per-node footprint a constant.
+///
+/// a peer *not* using this crate is a different matter — the kernel would let it send up
+/// to `SO_SNDBUF` — so `MSG_TRUNC` is still requested and an oversized message is
+/// reported and dropped rather than delivered as a silently shortened payload
 async fn recv_loop<H: Handler>(handler: Arc<H>, socket: Reactive) -> std::io::Result<()> {
-    let mut buf = vec![0u8; INITIAL_RECV_BUFFER];
+    let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
     let mut control = [MaybeUninit::uninit(); MAX_ANCILLARY_BUFFER_SIZE];
-    // a datagram can never be larger than the socket's own receive buffer, so this is a
-    // hard bound on how far `buf` can ever have to grow
-    let ceiling = wire::recv_buffer_limit(socket.get_ref()).max(INITIAL_RECV_BUFFER);
 
     loop {
-        let received = socket
-            .recv_growing(&mut buf, &mut control, ceiling)
-            .await?;
+        let received = socket.recv(&mut buf, &mut control).await?;
         if received.bytes == 0 {
             return Ok(());
         }
-        // the peek should have grown the buffer already; this can only fire if a peer
-        // sent something larger than the socket buffer itself, which the kernel rejects
-        debug_assert!(
-            !received.truncated(buf.len()),
-            "a message survived the peek and still did not fit"
-        );
+        if received.truncated(buf.len()) {
+            // only reachable from a peer that isn't going through `Ref::try_send`
+            eprintln!(
+                "strong-ipc: dropped a {} B message from a peer ignoring the {} B limit",
+                received.bytes, MAX_MESSAGE_SIZE
+            );
+            continue;
+        }
 
         handler
             .handle(&mut buf[..received.bytes], received.fds, received.creds)

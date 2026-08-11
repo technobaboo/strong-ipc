@@ -1,7 +1,7 @@
 //! `Ref` — a sending capability, and the two-tier send that keeps it cheap
 
 use crate::{
-    error::{Closed, TrySendError},
+    error::{SendError, TrySendError},
     message::Message,
     outbox::Outbox,
     wire,
@@ -90,16 +90,17 @@ impl Ref {
     /// this is what you want unless you have something better to do than wait. Ordering
     /// is preserved for any one sender: a caller awaiting here cannot have another send
     /// of its own in flight to overtake it.
-    pub async fn send(&self, message: Message) -> Result<(), Closed> {
+    pub async fn send(&self, message: Message) -> Result<(), SendError> {
         let message = match self.try_send(message) {
             Ok(()) => return Ok(()),
-            Err(TrySendError::Closed(m)) => return Err(Closed(m)),
+            Err(TrySendError::Closed(m)) => return Err(SendError::Closed(m)),
+            Err(TrySendError::TooLarge(m)) => return Err(SendError::TooLarge(m)),
             Err(TrySendError::Full(m)) => m,
         };
         // `try_send` only reports `Full` once the outbox exists, so this cannot be the
         // call that has to build it — but handle the failure rather than assuming
         let Ok(outbox) = self.inner.outbox() else {
-            return Err(Closed(message));
+            return Err(SendError::Closed(message));
         };
         outbox.send(message).await
     }
@@ -119,6 +120,12 @@ impl Ref {
     /// exactly the path that is already under pressure, which is the wrong trade
     #[allow(clippy::result_large_err)]
     pub fn try_send(&self, message: Message) -> Result<(), TrySendError> {
+        // refused here rather than at the syscall, so an oversized message never reaches
+        // the wire and is never mistaken for a dead peer. the receiving side sizes its
+        // buffer to exactly this limit, which is what makes truncation unreachable
+        if message.data().len() > wire::MAX_MESSAGE_SIZE {
+            return Err(TrySendError::TooLarge(message));
+        }
         // a backlog can only exist if something already built the outbox, so an untouched
         // ref answers this with one relaxed load and no indirection
         let backed_up = self.inner.outbox.get().is_some_and(Outbox::is_backed_up);

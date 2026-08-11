@@ -57,6 +57,9 @@ async fn a_full_queue_is_reported_as_full_never_as_closed() {
             Err(TrySendError::Closed(_)) => {
                 panic!("a merely-full queue was reported as a dead peer at seq {seq}")
             }
+            Err(TrySendError::TooLarge(_)) => {
+                unreachable!("payload is a fixed {PAYLOAD} B, under the limit")
+            }
         }
     }
 

@@ -170,3 +170,60 @@ async fn messages_arrive_stamped_with_peer_credentials() {
     assert_eq!(creds.uid.as_raw(), rustix::process::getuid().as_raw());
     assert_eq!(creds.gid.as_raw(), rustix::process::getgid().as_raw());
 }
+
+/// an oversized payload is refused at the call site, not truncated at the far end
+///
+/// this is the contract that lets every receive buffer be a fixed `MAX_MESSAGE_SIZE`
+/// with no size probe in front of it: nothing that is accepted can overrun a receiver.
+/// The failure is early, visible, and belongs to the sender, which still holds its
+/// message and can shrink it or move the bulk behind a descriptor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_messages_are_refused_at_the_sender() {
+    let (node, mut rx) = collector();
+
+    // the largest accepted payload still goes through
+    node.get_ref()
+        .send(Message::from_data(vec![1u8; strong_ipc::MAX_MESSAGE_SIZE]))
+        .await
+        .expect("a payload of exactly MAX_MESSAGE_SIZE should be accepted");
+    let (got, _) = next(&mut rx).await;
+    assert_eq!(got.len(), strong_ipc::MAX_MESSAGE_SIZE);
+
+    // one byte more is refused, and comes back intact
+    for over in [1usize, 8, 4096, 57344] {
+        let len = strong_ipc::MAX_MESSAGE_SIZE + over;
+        let err = node
+            .get_ref()
+            .try_send(Message::from_data(vec![2u8; len]))
+            .expect_err("a payload over MAX_MESSAGE_SIZE should be refused");
+        match err {
+            TrySendError::TooLarge(returned) => {
+                assert_eq!(
+                    returned.data().len(),
+                    len,
+                    "the refused message was not handed back intact"
+                );
+            }
+            other => panic!("expected TooLarge for a {len} B payload, got {other:?}"),
+        }
+    }
+
+    // and `send` reports it too, rather than waiting forever for room that would never help
+    assert!(
+        matches!(
+            node.get_ref()
+                .send(Message::from_data(vec![3u8; strong_ipc::MAX_MESSAGE_SIZE + 1]))
+                .await,
+            Err(strong_ipc::SendError::TooLarge(_))
+        ),
+        "send should refuse an oversized payload rather than block on it"
+    );
+
+    // nothing oversized reached the handler
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "an oversized message was delivered anyway"
+    );
+}

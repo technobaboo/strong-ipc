@@ -22,14 +22,12 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref, TrySendError};
+use strong_ipc::{BoundNode, FdVec, Handler, MAX_MESSAGE_SIZE, Message, Node, Ref, TrySendError};
 
 /// stop the run once either side is using this much of its descriptor budget
 const FD_WARN_FRACTION: f64 = 0.80;
 /// how often the watchdog samples /proc
 const FD_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
-/// where recv_loop's read buffer starts; it grows if a peer sends something larger
-const RECV_BUF: usize = 8192;
 
 // ---------------------------------------------------------------- /proc helpers
 
@@ -347,6 +345,8 @@ impl Client {
         match self.server.try_send(message) {
             Ok(()) => true,
             Err(TrySendError::Closed(_)) => false,
+            // the payload-ceiling phase deliberately probes past MAX_MESSAGE_SIZE
+            Err(TrySendError::TooLarge(_)) => false,
             Err(TrySendError::Full(m)) => {
                 *backpressured += 1;
                 self.watch.sample();
@@ -798,39 +798,35 @@ async fn parent_main(args: Vec<String>) {
 
     // ---- oversize payload behaviour
     header("payload ceiling");
-    println!("  each size is sent three times, and all three should get through: the receive");
-    println!("  loop peeks each message's length before consuming it, so a buffer that is");
-    println!("  too small grows *before* the read rather than after. a 'dropped' on the");
-    println!("  first attempt would mean that peek is not happening.");
+    println!("  MAX_MESSAGE_SIZE is {} B. anything larger is refused at the call site, so", MAX_MESSAGE_SIZE);
+    println!("  the sender finds out immediately and still holds its message — nothing is");
+    println!("  truncated at the far end and nothing is lost in between.");
     for payload in [4096usize, 8192, 8193, 16384, 65536] {
+        client.quiesce().await;
         let data = vec![0x41u8; payload];
-        let mut outcome = ["", "", ""];
-        for attempt in &mut outcome {
-            // strictly sequential, or a straggler from the previous phase answers for us
-            client.quiesce().await;
-            let mut r = 0;
-            let sent_ok = client.send(client.message(&data, 1), &mut r).await;
-            let got = tokio::time::timeout(Duration::from_millis(500), client.rx.recv()).await;
-            *attempt = match (sent_ok, got) {
-                (true, Ok(Some(n))) if n == payload => "intact",
-                (true, Ok(Some(_))) => "TRUNCATED",
-                (true, Ok(None)) => "channel closed",
-                (true, Err(_)) => "dropped",
-                (false, _) => "send failed",
-            };
+        match client.server.try_send(client.message(&data, 1)) {
+            Err(TrySendError::TooLarge(returned)) => {
+                // the message comes back intact, so a caller can shrink it or move the
+                // bulk behind a descriptor and try again
+                println!(
+                    "  {payload:>6} B  → refused at send, message handed back ({} B still intact)",
+                    returned.data().len()
+                );
+                continue;
+            }
+            Err(e) => {
+                println!("  {payload:>6} B  → send failed: {e}");
+                continue;
+            }
+            Ok(()) => {}
         }
-        let note = match outcome {
-            ["intact", "intact", "intact"] if payload <= RECV_BUF => "fits both buffers as they are",
-            ["intact", "intact", "intact"] => "buffers grew ahead of the read — nothing lost",
-            _ => "LOST a message — the peek is not covering this",
-        };
-        println!(
-            "  {payload:>6} B  → {:<9} {:<9} {:<9}  {note}",
-            outcome[0], outcome[1], outcome[2]
-        );
+        match tokio::time::timeout(Duration::from_millis(500), client.rx.recv()).await {
+            Ok(Some(n)) if n == payload => println!("  {payload:>6} B  → echoed intact"),
+            Ok(Some(n)) => println!("  {payload:>6} B  → came back as {n} B — TRUNCATED"),
+            Ok(None) => println!("  {payload:>6} B  → reply channel closed"),
+            Err(_) => println!("  {payload:>6} B  → no reply within 500 ms (dropped)"),
+        }
     }
-    println!("  buffers start at {RECV_BUF} B and grow to whatever peers actually send, ahead of");
-    println!("  the read, so nothing is ever truncated or lost on the way up.");
 
     // ---- final resource summary
     header("resource summary");

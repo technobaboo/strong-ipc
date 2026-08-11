@@ -96,6 +96,7 @@ async fn dropping_the_last_ref_still_drains_the_queue() {
             Ok(()) => accepted += 1,
             Err(TrySendError::Full(_)) => break,
             Err(TrySendError::Closed(_)) => panic!("closed while filling"),
+            Err(TrySendError::TooLarge(_)) => unreachable!("fixed {PAYLOAD} B payload"),
         }
     }
     assert!(accepted > 0, "nothing was accepted");
@@ -159,6 +160,7 @@ async fn the_outbox_can_be_built_from_a_non_runtime_thread() {
                 Ok(()) => accepted += 1,
                 Err(TrySendError::Full(_)) => break,
                 Err(TrySendError::Closed(_)) => panic!("closed while filling off-runtime"),
+                Err(TrySendError::TooLarge(_)) => unreachable!("fixed {PAYLOAD} B payload"),
             }
         }
         accepted

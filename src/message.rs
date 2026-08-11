@@ -53,7 +53,12 @@ impl Message {
         self.fds.push(SendFd::Owned(fd));
     }
 
-    pub(crate) fn data(&self) -> &[u8] {
+    /// the payload
+    ///
+    /// public mainly so a caller can inspect a message handed back by a failed send —
+    /// [`crate::TrySendError::TooLarge`] in particular, where the useful next step is to
+    /// look at how big it actually is
+    pub fn data(&self) -> &[u8] {
         &self.data
     }
     pub(crate) fn fds(&self) -> &[SendFd] {

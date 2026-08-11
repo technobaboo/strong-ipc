@@ -97,6 +97,9 @@ async fn main() {
                     tokio::task::yield_now().await;
                 }
                 Err(TrySendError::Closed(_)) => panic!("target ref closed at seq {seq}"),
+                Err(TrySendError::TooLarge(_)) => {
+                    unreachable!("payload is a fixed {PAYLOAD} B, under the limit")
+                }
             }
         }
         if seq % 1024 == 0 {

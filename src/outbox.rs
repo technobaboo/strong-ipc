@@ -9,7 +9,7 @@
 //! [`Ref`]: crate::Ref
 
 use crate::{
-    error::{Closed, TrySendError},
+    error::{SendError, TrySendError},
     message::Message,
     wire::Reactive,
 };
@@ -98,9 +98,9 @@ impl Outbox {
     /// takes the slot *before* claiming it in `pending`, so the window between the claim
     /// and the push stays as tight as [`Outbox::push`]'s. Incrementing first and then
     /// awaiting would hold the inline fast path shut for the entire wait
-    pub(crate) async fn send(&self, message: Message) -> Result<(), Closed> {
+    pub(crate) async fn send(&self, message: Message) -> Result<(), SendError> {
         let Ok(permit) = self.sender.reserve().await else {
-            return Err(Closed(message));
+            return Err(SendError::Closed(message));
         };
         self.pending.fetch_add(1, Ordering::AcqRel);
         permit.send(message);

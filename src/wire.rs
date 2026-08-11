@@ -49,8 +49,26 @@ pub const EXPECTED_ANCILLARY_BUFFER_SIZE: usize =
 pub(crate) const MAX_ANCILLARY_BUFFER_SIZE: usize =
     rustix::cmsg_space!(ScmRights(MAX_FDS), ScmCredentials(1));
 
-/// how big a receive buffer starts out; it grows if a peer sends something larger
-pub(crate) const INITIAL_RECV_BUFFER: usize = 8192;
+/// the largest payload a [`Message`] may carry — **the one number to tune**
+///
+/// this governs two things at once, and that is the point:
+///   - [`crate::Ref::try_send`] refuses anything larger, before it leaves the process
+///   - every receive buffer is exactly this size, and never needs to grow
+///
+/// because no accepted send can exceed it, a receive buffer of this size can never be
+/// truncated. That is what lets the receive path be a single `recvmsg` with no size probe
+/// in front of it, and what keeps the cost per node fixed rather than per-peer.
+///
+/// the memory is per *connection*, so at thousands of nodes this is the number that
+/// decides your footprint: 8 KiB × 1000 nodes is 8 MiB. Raising it is a linear cost.
+///
+/// it is deliberately small. A capability system's answer to a large payload is not a
+/// larger payload — it is a `memfd` or dmabuf attached with [`crate::Message::add_fd`],
+/// which costs one descriptor, is zero-copy, and does not touch this budget at all.
+///
+/// the kernel enforces its own ceiling on top of this (`SO_SNDBUF`, 256 KiB by default,
+/// reported as `EMSGSIZE`), so raising this past that will not work.
+pub const MAX_MESSAGE_SIZE: usize = 8192;
 
 fn flags_for_send() -> SendFlags {
     // DONTWAIT so this never parks the caller; NOSIGNAL so a dead peer surfaces as EPIPE
@@ -200,40 +218,12 @@ pub(crate) fn recv_now(
     })
 }
 
-/// the true length of the next queued datagram, without consuming it
-///
-/// `MSG_PEEK` leaves the message in the queue and `MSG_TRUNC` makes the return value the
-/// datagram's real length rather than however much was copied — so with no iovec at all
-/// this is a pure "how big is the next one?" query.
-///
-/// the control buffer is deliberately zero-length. Peeking a message that carries
-/// `SCM_RIGHTS` into a *real* control buffer would have the kernel install those
-/// descriptors into us, and because the message stays queued the following `recvmsg`
-/// installs them a second time — a descriptor leak on every message. With nowhere to put
-/// them the kernel just flags `MSG_CTRUNC` and leaves them attached to the queued message
-pub(crate) fn peek_len(fd: BorrowedFd<'_>) -> std::io::Result<usize> {
-    let mut no_data: [IoSliceMut<'_>; 0] = [];
-    let mut no_control = RecvAncillaryBuffer::new(&mut []);
-    let msg = net::recvmsg(
-        fd,
-        &mut no_data,
-        &mut no_control,
-        RecvFlags::PEEK | RecvFlags::TRUNC,
-    )?;
-    Ok(msg.bytes)
-}
-
 /// accepts one pending connection, non-blocking
 pub(crate) fn accept_now(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
     Ok(net::accept_with(
         fd,
         SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
     )?)
-}
-
-/// the socket's receive buffer, which bounds the largest datagram it can ever deliver
-pub(crate) fn recv_buffer_limit(fd: BorrowedFd<'_>) -> usize {
-    net::sockopt::socket_recv_buffer_size(fd).unwrap_or(INITIAL_RECV_BUFFER)
 }
 
 /// asks the kernel to stamp every incoming message with the sender's credentials
@@ -268,10 +258,6 @@ impl Reactive {
         })
     }
 
-    pub(crate) fn get_ref(&self) -> BorrowedFd<'_> {
-        self.io.get_ref().as_fd()
-    }
-
     /// waits for room, then sends
     ///
     /// the same `send_now` the inline fast path uses, with readiness in front of it
@@ -287,39 +273,21 @@ impl Reactive {
         }
     }
 
-    /// receives the next message, growing `buf` first if it would not fit
+    /// receives the next message
     ///
-    /// peeks the datagram's length before consuming it, so an oversized message is never
-    /// destroyed by a buffer too small to hold it. That costs a second syscall on every
-    /// receive, which is the price of never losing a message — see the note on
-    /// [`peek_len`] for why the peek must carry no control buffer.
-    ///
-    /// the peek is skipped once `buf` has reached `ceiling`: a datagram cannot exceed the
-    /// socket's own receive buffer, so at that point truncation is impossible and there
-    /// is nothing left to ask about
-    pub(crate) async fn recv_growing(
+    /// one syscall, no size probe: `buf` is always [`MAX_MESSAGE_SIZE`] and no accepted
+    /// send can exceed that, so a message from a peer using this crate always fits.
+    /// `MSG_TRUNC` is still requested so that a peer *not* using this crate — which the
+    /// kernel would let send up to `SO_SNDBUF` — is detected rather than silently
+    /// delivering a shortened payload
+    pub(crate) async fn recv(
         &self,
-        buf: &mut Vec<u8>,
+        buf: &mut [u8],
         control_space: &mut [MaybeUninit<u8>],
-        ceiling: usize,
     ) -> std::io::Result<Received> {
         loop {
             let mut guard = self.io.readable().await?;
-            let buf = &mut *buf;
-            let control_space = &mut *control_space;
-            // both syscalls happen under one readiness guard, so a peek that finds the
-            // socket empty retries the whole thing rather than desynchronising the two
-            let attempt = guard.try_io(|inner| {
-                let fd = inner.get_ref().as_fd();
-                if buf.len() < ceiling {
-                    let len = peek_len(fd)?;
-                    if len > buf.len() {
-                        buf.resize(len.min(ceiling), 0);
-                    }
-                }
-                recv_now(fd, buf, control_space)
-            });
-            match attempt {
+            match guard.try_io(|inner| recv_now(inner.get_ref().as_fd(), buf, control_space)) {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }

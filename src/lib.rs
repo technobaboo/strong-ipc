@@ -12,10 +12,16 @@
 //!   socket ──► recv_loop ──► Handler::handle(data, fds, creds)
 //! ```
 //!
-//! [`Ref::send`] waits for room and so can only fail with [`Closed`]; [`Ref::try_send`]
-//! never blocks and reports [`TrySendError::Full`] when the socket and the outbound queue
-//! are both backed up. Both hand the [`Message`] back on failure, so a caller can retry
-//! with it rather than rebuilding it. Prefer `send` — spinning on `Full` is a busy-wait.
+//! [`Ref::send`] waits for room; [`Ref::try_send`] never blocks and reports
+//! [`TrySendError::Full`] when the socket and the outbound queue are both backed up.
+//! Both hand the [`Message`] back on failure, so a caller can retry with it rather than
+//! rebuilding it. Prefer `send` — spinning on `Full` is a busy-wait.
+//!
+//! A payload over [`MAX_MESSAGE_SIZE`] is refused at the call site rather than truncated
+//! at the far end. That one constant is also every receive buffer's size, so an accepted
+//! send can never overrun a receiver: the failure is visible, early, and belongs to the
+//! sender. Bulk data belongs behind a descriptor — attach a `memfd` with
+//! [`Message::add_fd`] and pay one descriptor instead of a copy.
 //!
 //! `creds` is the kernel's word on who the peer is, not the peer's: `SO_PASSCRED` is set
 //! by the receiving side, so credentials cannot be forged or omitted by the sender.
@@ -62,10 +68,10 @@ mod outbox;
 pub mod wire;
 
 pub use capability::Ref;
-pub use error::{Closed, TrySendError};
+pub use error::{SendError, TrySendError};
 pub use message::{FdVec, Message};
 pub use node::{BoundNode, Handler, Node};
-pub use wire::{EXPECTED_ANCILLARY_BUFFER_SIZE, MAX_FDS};
+pub use wire::{EXPECTED_ANCILLARY_BUFFER_SIZE, MAX_FDS, MAX_MESSAGE_SIZE};
 
 /// the peer's credentials, as reported by `SCM_CREDENTIALS`
 ///
