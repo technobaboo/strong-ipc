@@ -1,9 +1,6 @@
-#![allow(clippy::result_large_err)]
-
 use smallvec::SmallVec;
 use std::{
     ffi::c_void,
-    ops::Deref,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
     sync::{
@@ -22,8 +19,14 @@ use tokio_seqpacket::{
 };
 use tokio_util::task::AbortOnDrop;
 
+/// the kernel's `SCM_MAX_FD` — the most descriptors one `SCM_RIGHTS` block can carry
 pub const MAX_FDS: usize = 253;
-pub const EXPECTED_FDS: usize = 8;
+/// how many descriptors a message is expected to carry in the common case
+///
+/// sizes the inline capacity of [`FdVec`] and `Message`'s descriptor list, and the stack
+/// ancillary buffer. Nothing is capped at this — it is purely the point past which these
+/// spill to the heap
+pub(crate) const EXPECTED_FDS: usize = 8;
 pub const EXPECTED_ANCILLARY_BUFFER_SIZE: usize = {
     // one block for the fds...
     (unsafe { libc::CMSG_SPACE((EXPECTED_FDS * size_of::<RawFd>()) as u32) }
@@ -41,14 +44,19 @@ pub trait Handler: Send + Sync + 'static {
     ) -> impl Future<Output = ()> + Send + Sync;
 }
 
-pub type FdVec = SmallVec<[OwnedFd; MAX_FDS]>;
+/// the descriptors that arrived on a message
+///
+/// inline up to [`EXPECTED_FDS`], heap-allocated beyond it. sizing this by `MAX_FDS`
+/// instead would put a kilobyte of descriptors on the stack for every message, almost
+/// always to hold one or none
+pub type FdVec = SmallVec<[OwnedFd; EXPECTED_FDS]>;
 
 /// a fd to send as ancillary data on a [`Message`]
 ///
 /// `SCM_RIGHTS` only borrows the fd, the kernel dups it into the receiver's table and
 /// leaves yours alone, so this just has to keep something alive that can hand out a
 /// [`BorrowedFd`] at send time. never needs a local `dup` either way
-pub enum SendFd {
+enum SendFd {
     /// a fd owned outright, e.g. forwarded out of `Handler::handle`
     Owned(OwnedFd),
     /// a clone of a [`Ref`], shared rather than duped
@@ -65,8 +73,7 @@ impl AsFd for SendFd {
 
 pub struct Message {
     data: Vec<u8>,
-    fds: SmallVec<[SendFd; MAX_FDS]>,
-    // peer_creds: bool,
+    fds: SmallVec<[SendFd; EXPECTED_FDS]>,
 }
 impl Message {
     pub fn from_data(data: Vec<u8>) -> Self {
@@ -92,38 +99,30 @@ pub struct Node<H: Handler> {
     ref_: Ref,
     _task: AbortOnDrop,
 }
-impl<H: Handler> Deref for Node<H> {
-    type Target = H;
-
-    fn deref(&self) -> &Self::Target {
-        &self.handler
-    }
-}
 impl<H: Handler> Node<H> {
     pub fn new(handler: H) -> std::io::Result<Node<H>> {
         Node::new_raw(Arc::new(handler))
     }
     pub fn new_raw(handler: Arc<H>) -> std::io::Result<Node<H>> {
         let (tx, rx) = UnixSeqpacket::pair()?;
-        let ref_ = Ref::from_seqpacket(tx)?;
-
-        Node::from_seqpacket(handler, rx, ref_)
-    }
-    fn from_seqpacket(
-        handler: Arc<H>,
-        seqpacket: UnixSeqpacket,
-        ref_: Ref,
-    ) -> std::io::Result<Self> {
-        let task = tokio::spawn(recv_loop(handler.clone(), seqpacket));
+        let task = tokio::spawn(recv_loop(handler.clone(), rx));
         Ok(Self {
             handler,
-            ref_,
+            ref_: Ref::from_seqpacket(tx),
             _task: AbortOnDrop::new(task.abort_handle()),
         })
     }
     /// a `Ref` pointing back at this node, alive as long as the node is
     pub fn get_ref(&self) -> &Ref {
         &self.ref_
+    }
+    /// the handler this node is feeding
+    ///
+    /// deliberately a named method rather than a `Deref` impl: a `Node` is not a handler,
+    /// and quietly putting every one of `H`'s methods onto it hides which of the two you
+    /// are actually talking to
+    pub fn handler(&self) -> &H {
+        &self.handler
     }
 }
 
@@ -171,16 +170,9 @@ async fn recv_loop<H: Handler>(handler: Arc<H>, seqpacket: UnixSeqpacket) -> std
 /// with the boundnode
 pub struct BoundNode<H: Handler> {
     handler: Arc<H>,
-    /// only set if we made the socket file, so we know whether it's ours to unlink
-    path: Option<PathBuf>,
+    /// we made this socket file, so it's ours to unlink again on drop
+    path: PathBuf,
     _accept_task: AbortOnDrop,
-}
-impl<H: Handler> Deref for BoundNode<H> {
-    type Target = H;
-
-    fn deref(&self) -> &Self::Target {
-        &self.handler
-    }
 }
 impl<H: Handler> BoundNode<H> {
     /// binds a socket at `path`, unlinked again on drop
@@ -194,24 +186,18 @@ impl<H: Handler> BoundNode<H> {
     pub fn bind_raw<P: AsRef<Path>>(path: P, handler: Arc<H>) -> std::io::Result<Self> {
         let path = path.as_ref();
         let listener = UnixSeqpacketListener::bind(path)?;
-
-        let mut node = Self::from_listener(listener, handler)?;
-        node.path = Some(path.to_owned());
-        Ok(node)
-    }
-    /// takes over an already-bound listener, e.g. one handed to us by a service manager
-    ///
-    /// leaves the socket file alone on drop since it isn't ours to remove
-    pub fn from_listener(
-        listener: UnixSeqpacketListener,
-        handler: Arc<H>,
-    ) -> std::io::Result<Self> {
         let task = tokio::spawn(Self::task(listener, handler.clone()));
         Ok(Self {
             handler,
-            path: None,
+            path: path.to_owned(),
             _accept_task: AbortOnDrop::new(task.abort_handle()),
         })
+    }
+    /// the handler shared by every connection this node accepts
+    ///
+    /// see [`Node::handler`] for why this isn't a `Deref`
+    pub fn handler(&self) -> &H {
+        &self.handler
     }
     async fn task(mut listener: UnixSeqpacketListener, handler: Arc<H>) -> std::io::Result<()> {
         // lives in the task and not the boundnode so it needs no locking, killing this
@@ -227,9 +213,7 @@ impl<H: Handler> BoundNode<H> {
 }
 impl<H: Handler> Drop for BoundNode<H> {
     fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = std::fs::remove_file(path);
-        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -361,19 +345,20 @@ impl Ref {
     /// nothing comes back this way, if you want a reply, put a ref of your own on the
     /// message with [`Message::add_ref`]
     pub async fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        Self::from_seqpacket(UnixSeqpacket::connect(path).await?)
+        Ok(Self::from_seqpacket(UnixSeqpacket::connect(path).await?))
     }
     /// wraps an fd received over `SCM_RIGHTS`
     ///
-    /// costs one allocation and nothing else — no reactor registration, no task. this is
-    /// the hot path: a node handling capabilities builds one of these per message
-    pub fn from_owned_fd(fd: OwnedFd) -> std::io::Result<Self> {
-        Ok(Self::from_fd(fd))
+    /// costs one allocation and nothing else — no reactor registration, no task, nothing
+    /// that can fail. this is the hot path: a node handling capabilities builds one of
+    /// these per message
+    pub fn from_owned_fd(fd: OwnedFd) -> Self {
+        Self::from_fd(fd)
     }
-    pub fn from_seqpacket(seqpacket: UnixSeqpacket) -> std::io::Result<Self> {
+    pub(crate) fn from_seqpacket(seqpacket: UnixSeqpacket) -> Self {
         // hand back the reactor registration the socket arrived with; if this ref ever
         // backs up, the slow path registers a dup of its own
-        Ok(Self::from_fd(OwnedFd::from(seqpacket)))
+        Self::from_fd(OwnedFd::from(seqpacket))
     }
     fn from_fd(fd: OwnedFd) -> Self {
         Self {
@@ -396,9 +381,6 @@ impl Ref {
             };
 
             let mut ancillary_message_writer = AncillaryMessageWriter::new(&mut ancillary_buffer);
-            // if message.peer_creds {
-            // ancillary_message_writer.add_ucreds([UCred {}])
-            // }
             ancillary_message_writer.add_fds(message.fds.iter().map(|f| f.borrow_fd()))?;
             let result = seqpacket
                 .send_with_ancillary(&message.data, &mut ancillary_message_writer)
@@ -415,6 +397,12 @@ impl Ref {
     /// tries the syscall inline first, so in the common case there is no channel, no
     /// task wakeup and no scheduler hop. only a socket that is genuinely backed up falls
     /// through to the queue, and only a full queue gives `Full` back
+    ///
+    /// the error carries the `Message` back so a caller that hit backpressure can retry
+    /// with it rather than losing it. that makes the `Err` variant 176 bytes, past
+    /// clippy's 128-byte comfort line — but boxing it would put a heap allocation on
+    /// exactly the path that is already under pressure, which is the wrong trade
+    #[allow(clippy::result_large_err)]
     pub fn send_message(&self, message: Message) -> Result<(), TrySendError<Message>> {
         // a backlog can only exist if something already built the slow path, so an
         // untouched ref answers this with one relaxed load and no indirection
@@ -451,5 +439,30 @@ impl Ref {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Message` is moved by value on every send, including back out of a failed
+    /// `try_send`, so its inline descriptor storage has to stay small
+    ///
+    /// sizing the SmallVec by `MAX_FDS` instead of `EXPECTED_FDS` put roughly four
+    /// kilobytes on the stack per message, which is what made clippy's `result_large_err`
+    /// fire and had to be silenced crate-wide
+    #[test]
+    fn message_stays_small() {
+        assert!(
+            size_of::<Message>() <= 256,
+            "Message is {} B — check the inline capacity of its descriptor list",
+            size_of::<Message>()
+        );
+        assert!(
+            size_of::<FdVec>() <= 128,
+            "FdVec is {} B",
+            size_of::<FdVec>()
+        );
     }
 }

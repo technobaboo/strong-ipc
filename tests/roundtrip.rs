@@ -90,7 +90,7 @@ impl Handler for Echo {
         let Some(fd) = fds.into_iter().next() else {
             return;
         };
-        let reply = Ref::from_owned_fd(fd).unwrap();
+        let reply = Ref::from_owned_fd(fd);
         let _ = reply.send_message(Message::from_data(data.to_vec()));
     }
 }

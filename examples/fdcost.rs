@@ -243,7 +243,7 @@ impl Handler for EchoHandler {
                 let Some(fd) = fds.next() else {
                     return;
                 };
-                let r = Ref::from_owned_fd(fd).expect("from_owned_fd");
+                let r = Ref::from_owned_fd(fd);
                 self.refs_built.fetch_add(1, Ordering::Relaxed);
                 if op == OP_ESTABLISH {
                     *self.cached.lock().unwrap() = Some(r.clone());

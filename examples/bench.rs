@@ -14,7 +14,6 @@
 //! `--fd-limit N` to squeeze both processes into a small descriptor budget on purpose.
 
 use std::{
-    io::ErrorKind,
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
@@ -193,20 +192,11 @@ impl Handler for EchoHandler {
 
         let mut fds = fds.into_iter();
         let reply = match fds.next() {
-            Some(fd) => match Ref::from_owned_fd(fd) {
-                Ok(r) => {
-                    *self.cached.lock().unwrap() = Some(r.clone());
-                    r
-                }
-                Err(e) => {
-                    eprintln!("server: could not build a ref from the received fd: {e}");
-                    if e.kind() == ErrorKind::Other || is_fd_exhaustion(&e) {
-                        eprintln!("server: FD EXHAUSTION while accepting a capability");
-                        std::process::exit(4);
-                    }
-                    return;
-                }
-            },
+            Some(fd) => {
+                let r = Ref::from_owned_fd(fd);
+                *self.cached.lock().unwrap() = Some(r.clone());
+                r
+            }
             None => match self.cached.lock().unwrap().clone() {
                 Some(r) => r,
                 None => return,
@@ -228,13 +218,6 @@ impl Handler for EchoHandler {
             }
         }
     }
-}
-
-fn is_fd_exhaustion(e: &std::io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EMFILE) | Some(libc::ENFILE)
-    )
 }
 
 async fn server_main(path: PathBuf) {

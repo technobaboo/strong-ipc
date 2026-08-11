@@ -19,7 +19,6 @@ impl Handler for EchoHandler {
         };
         println!("received {text:?}, echoing it back");
         Ref::from_owned_fd(return_fd)
-            .unwrap()
             .send_message(Message::from_data(text.into_bytes()))
             .unwrap();
     }

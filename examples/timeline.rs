@@ -107,16 +107,11 @@ impl Handler for EchoHandler {
 
         let mut fds = fds.into_iter();
         let reply = match fds.next() {
-            Some(fd) => match Ref::from_owned_fd(fd) {
-                Ok(r) => {
-                    *self.cached.lock().unwrap() = Some(r.clone());
-                    r
-                }
-                Err(e) => {
-                    eprintln!("server: could not build a ref from the received fd: {e}");
-                    return;
-                }
-            },
+            Some(fd) => {
+                let r = Ref::from_owned_fd(fd);
+                *self.cached.lock().unwrap() = Some(r.clone());
+                r
+            }
             None => match self.cached.lock().unwrap().clone() {
                 Some(r) => r,
                 None => return,

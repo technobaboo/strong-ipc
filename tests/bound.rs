@@ -24,7 +24,7 @@ impl Handler for Echo {
         let Some(fd) = fds.into_iter().next() else {
             return;
         };
-        let reply = Ref::from_owned_fd(fd).unwrap();
+        let reply = Ref::from_owned_fd(fd);
         let mut out = self.tag.as_bytes().to_vec();
         out.extend_from_slice(data);
         let _ = reply.send_message(Message::from_data(out));
