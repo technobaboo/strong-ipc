@@ -1,15 +1,17 @@
 //! the receiving side: what turns bytes on a socket back into a handler call
 
-use crate::{Ref, message::FdVec, wire::EXPECTED_ANCILLARY_BUFFER_SIZE};
-use smallvec::SmallVec;
+use crate::{
+    Ref,
+    message::FdVec,
+    wire::{self, INITIAL_RECV_BUFFER, MAX_ANCILLARY_BUFFER_SIZE, Reactive},
+};
+use rustix::net::UCred;
 use std::{
+    mem::MaybeUninit,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::task::JoinSet;
-use tokio_seqpacket::{
-    UCred, UnixSeqpacket, UnixSeqpacketListener, ancillary::OwnedAncillaryMessage,
-};
 use tokio_util::task::AbortOnDrop;
 
 pub trait Handler: Send + Sync + 'static {
@@ -31,11 +33,11 @@ impl<H: Handler> Node<H> {
         Node::new_raw(Arc::new(handler))
     }
     pub fn new_raw(handler: Arc<H>) -> std::io::Result<Node<H>> {
-        let (tx, rx) = UnixSeqpacket::pair()?;
-        let task = tokio::spawn(recv_loop(handler.clone(), rx));
+        let (tx, rx) = wire::socketpair()?;
+        let task = tokio::spawn(recv_loop(handler.clone(), Reactive::new(rx)?));
         Ok(Self {
             handler,
-            ref_: Ref::from_seqpacket(tx),
+            ref_: Ref::from_fd(tx),
             _task: AbortOnDrop::new(task.abort_handle()),
         })
     }
@@ -57,31 +59,39 @@ impl<H: Handler> Node<H> {
 ///
 /// free-standing since node and boundnode share no type, they just both need something
 /// to feed a handler. `Ok` means the peer hung up, not an error, though that's just a
-/// zero-length read, same as an empty message, so sending one looks like a disconnect
-async fn recv_loop<H: Handler>(handler: Arc<H>, seqpacket: UnixSeqpacket) -> std::io::Result<()> {
-    let mut buf = vec![0u8; 8192];
-    let mut ancillary_buf = vec![0u8; EXPECTED_ANCILLARY_BUFFER_SIZE];
+/// zero-length read, same as an empty message, so sending one looks like a disconnect.
+///
+/// the payload buffer starts small and grows to whatever peers actually send. `MSG_TRUNC`
+/// is always requested, so an oversized message reports its true length instead of being
+/// silently shortened — the message that discovered the new size is still lost, but every
+/// later one of that size fits. the control buffer needs no such treatment: it is sized
+/// for `MAX_FDS` up front, because a truncated control message means the kernel dropped
+/// descriptors, and a silently dropped descriptor is a capability that vanished
+async fn recv_loop<H: Handler>(handler: Arc<H>, socket: Reactive) -> std::io::Result<()> {
+    let mut buf = vec![0u8; INITIAL_RECV_BUFFER];
+    let mut control = [MaybeUninit::uninit(); MAX_ANCILLARY_BUFFER_SIZE];
+    let ceiling = wire::recv_buffer_limit(socket.get_ref()).max(INITIAL_RECV_BUFFER);
+
     loop {
-        let (message_info, ancillary_messages) = seqpacket
-            .recv_with_ancillary(&mut buf, &mut ancillary_buf)
-            .await?;
-        if message_info.bytes_read() == 0 {
+        let received = socket.recv(&mut buf, &mut control).await?;
+        if received.bytes == 0 {
             return Ok(());
         }
-        let mut fd_buf = SmallVec::new();
-        let mut peer_cred: Option<UCred> = None;
-        for ancillary_data in ancillary_messages.into_messages() {
-            match ancillary_data {
-                OwnedAncillaryMessage::FileDescriptors(fds) => fd_buf.extend(fds),
-                OwnedAncillaryMessage::Credentials(mut creds) => {
-                    peer_cred = creds.next();
-                }
-                OwnedAncillaryMessage::Other(_) => (),
-            }
+        if received.truncated(buf.len()) {
+            // grow to fit and carry on; this message is already gone
+            let want = received.bytes.min(ceiling);
+            eprintln!(
+                "strong-ipc: dropped a {} B message that did not fit a {} B buffer; \
+                 growing to {want} B",
+                received.bytes,
+                buf.len()
+            );
+            buf.resize(want, 0);
+            continue;
         }
 
         handler
-            .handle(&mut buf[..message_info.bytes_read()], fd_buf, peer_cred)
+            .handle(&mut buf[..received.bytes], received.fds, received.creds)
             .await;
     }
 }
@@ -112,7 +122,7 @@ impl<H: Handler> BoundNode<H> {
     }
     pub fn bind_raw<P: AsRef<Path>>(path: P, handler: Arc<H>) -> std::io::Result<Self> {
         let path = path.as_ref();
-        let listener = UnixSeqpacketListener::bind(path)?;
+        let listener = Reactive::new(wire::bind(path)?)?;
         let task = tokio::spawn(Self::task(listener, handler.clone()));
         Ok(Self {
             handler,
@@ -126,15 +136,15 @@ impl<H: Handler> BoundNode<H> {
     pub fn handler(&self) -> &H {
         &self.handler
     }
-    async fn task(mut listener: UnixSeqpacketListener, handler: Arc<H>) -> std::io::Result<()> {
+    async fn task(listener: Reactive, handler: Arc<H>) -> std::io::Result<()> {
         // lives in the task and not the boundnode so it needs no locking, killing this
         // task drops the set, and every connection with it
         let mut connections = JoinSet::new();
         loop {
-            let seqpacket = listener.accept().await?;
+            let fd = listener.accept().await?;
             // clear out whoever hung up since, so this doesn't grow forever
             while connections.try_join_next().is_some() {}
-            connections.spawn(recv_loop(handler.clone(), seqpacket));
+            connections.spawn(recv_loop(handler.clone(), Reactive::new(fd)?));
         }
     }
 }

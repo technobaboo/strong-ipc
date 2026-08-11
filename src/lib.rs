@@ -33,28 +33,36 @@
 //!
 //! # Module map
 //!
+//! The crate is `forbid(unsafe_code)`: every syscall goes through `rustix`'s typed,
+//! safe wrappers, so there is no raw `msghdr` construction anywhere.
+//!
 //! | module | what lives there |
 //! |---|---|
-//! | [`wire`] | the only code that talks to the kernel, and the only `unsafe` |
+//! | [`wire`] | the only code that talks to the kernel — every syscall in the crate |
 //! | `message` | [`Message`], [`FdVec`] — payload plus attached capabilities |
 //! | `capability` | [`Ref`] and its two-tier send |
 //! | `outbox` | the backlog a `Ref` grows only once its socket backs up |
 //! | `node` | [`Handler`], [`Node`], [`BoundNode`], and the receive loop |
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod capability;
 mod message;
 mod node;
 mod outbox;
-// the one module allowed to touch raw syscalls; everything else is safe Rust
-#[allow(unsafe_code)]
 pub mod wire;
 
 pub use capability::Ref;
 pub use message::{FdVec, Message};
 pub use node::{BoundNode, Handler, Node};
 pub use wire::{EXPECTED_ANCILLARY_BUFFER_SIZE, MAX_FDS};
+
+/// the peer's credentials, as reported by `SCM_CREDENTIALS`
+///
+/// re-exported so implementing [`Handler`] doesn't require naming one of our
+/// dependencies — the type appears in the trait, so it is part of this crate's API
+/// whether or not we own it
+pub use rustix::net::UCred;
 
 #[cfg(test)]
 mod tests {

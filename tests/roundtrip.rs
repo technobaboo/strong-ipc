@@ -8,26 +8,25 @@ use tokio::sync::mpsc::error::TrySendError;
 
 /// hands every received message straight back to the test
 struct Collector {
-    tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, Vec<OwnedFd>)>,
+    tx: tokio::sync::mpsc::UnboundedSender<Delivered>,
 }
 
 impl Handler for Collector {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let _ = self.tx.send((data.to_vec(), fds.into_iter().collect()));
     }
 }
 
-fn collector() -> (
-    Node<Collector>,
-    tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, Vec<OwnedFd>)>,
-) {
+/// one delivered message: its payload and whatever descriptors rode along
+type Delivered = (Vec<u8>, Vec<OwnedFd>);
+type Inbox = tokio::sync::mpsc::UnboundedReceiver<Delivered>;
+
+fn collector() -> (Node<Collector>, Inbox) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (Node::new(Collector { tx }).unwrap(), rx)
 }
 
-async fn next(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, Vec<OwnedFd>)>,
-) -> (Vec<u8>, Vec<OwnedFd>) {
+async fn next(rx: &mut Inbox) -> Delivered {
     tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("timed out waiting for a message")
@@ -38,7 +37,8 @@ async fn next(
 async fn payloads_arrive_intact() {
     let (node, mut rx) = collector();
 
-    // 8192 is exactly `recv_loop`'s buffer, so it is the largest size that fits today
+    // 8192 is where `recv_loop`'s buffer starts, so these all fit without it having to
+    // grow — the growth path itself is covered by the payload-ceiling phase in bench.rs
     for len in [1usize, 2, 64, 512, 4096, 8191, 8192] {
         let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         node.get_ref()
@@ -86,7 +86,7 @@ async fn zero_length_message_looks_like_a_hangup() {
 /// echoes whatever it receives back on the capability it was handed
 struct Echo;
 impl Handler for Echo {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let Some(fd) = fds.into_iter().next() else {
             return;
         };

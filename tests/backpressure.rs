@@ -19,7 +19,7 @@ struct Gated {
 }
 
 impl Handler for Gated {
-    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let mut gate = self.gate.clone();
         while !*gate.borrow_and_update() {
             if gate.changed().await.is_err() {

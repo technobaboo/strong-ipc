@@ -225,7 +225,7 @@ struct EchoHandler {
 }
 
 impl Handler for EchoHandler {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         if data.starts_with(b"QUIT") {
             eprintln!(
                 "      [server saw {} descriptors, promoted {} of them to Refs]",
@@ -328,7 +328,7 @@ async fn server_main(path: PathBuf) {
 
 struct ReplyHandler(tokio::sync::mpsc::UnboundedSender<usize>);
 impl Handler for ReplyHandler {
-    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let _ = self.0.send(data.len());
     }
 }

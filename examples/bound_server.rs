@@ -9,7 +9,7 @@ use strong_ipc::{BoundNode, FdVec, Handler, Message, Ref};
 
 pub struct EchoHandler;
 impl Handler for EchoHandler {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let text = String::from_utf8_lossy(data).into_owned();
         // an accepted conn has no ref back out, so the client hands us one to reply on
         // in-band, as an fd on the message

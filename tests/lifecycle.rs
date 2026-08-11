@@ -3,7 +3,7 @@
 //! both are load-bearing and both are easy to break by accident while moving code:
 //!   - the outbound drain task is deliberately **not** an `AbortOnDrop`, so dropping the
 //!     last `Ref` still drains whatever it already accepted
-//!   - `RefInner` captures a `runtime::Handle` at construction, because the slow path is
+//!   - `RefInner` captures a `runtime::Handle` at construction, because the outbox is
 //!     built from `send_message`, which is sync and may not be on a runtime thread
 
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ struct Gated {
 }
 
 impl Handler for Gated {
-    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let mut gate = self.gate.clone();
         while !*gate.borrow_and_update() {
             if gate.changed().await.is_err() {
@@ -42,7 +42,7 @@ impl Handler for Gated {
 
 struct Null;
 impl Handler for Null {
-    async fn handle(&self, _d: &mut [u8], _f: FdVec, _c: Option<tokio_seqpacket::UCred>) {}
+    async fn handle(&self, _d: &mut [u8], _f: FdVec, _c: Option<strong_ipc::UCred>) {}
 }
 
 fn numbered(seq: u32) -> Message {
@@ -122,20 +122,18 @@ async fn dropping_the_last_ref_still_drains_the_queue() {
     assert_eq!(*seen, (0..accepted).collect::<Vec<_>>(), "queue drained out of order");
 }
 
-/// the slow path can be built from a thread that is not a runtime thread
+/// the outbox can be built from a thread that is not a runtime thread
 ///
-/// `send_message` is sync, so nothing stops a caller invoking it off-runtime. building the
+/// `send_message` is sync, so nothing stops a caller invoking it off-runtime. Building the
 /// outbox needs to spawn a task, which is why `RefInner` captures a `Handle` at
 /// construction rather than calling `Handle::current()` at use.
 ///
-/// that capture only covers half of it, which is why this is `#[ignore]`d: the handle is
-/// used for `spawn`, but registering the duplicated socket with the reactor needs to
-/// happen *inside* runtime context, and it does not. Today this panics with "there is no
-/// reactor running" the moment an off-runtime sender fills the socket. The fix is to hold
-/// a `runtime.enter()` guard across the registration — needed either way once the outbox
-/// moves to `AsyncFd`, which has the same requirement.
+/// that capture is necessary but not sufficient, which is what this test caught: the
+/// handle covers `spawn`, but registering the duplicated socket with the reactor needs
+/// runtime *context*, and holding a handle is not the same as being entered into it.
+/// Without the `enter()` guard in `Outbox::build` this panics with "there is no reactor
+/// running" the moment an off-runtime sender fills its socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "panics until outbox construction enters the runtime before registering (step 4)"]
 async fn the_outbox_can_be_built_from_a_non_runtime_thread() {
     let path = socket_path("offthread");
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);

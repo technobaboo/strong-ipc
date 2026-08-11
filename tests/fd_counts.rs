@@ -1,19 +1,16 @@
 //! how many capabilities can actually ride on one message?
 //!
-//! `MAX_FDS` is 253 — the kernel's `SCM_MAX_FD` — and that is what
-//! `Ref::send_message` gates the inline path on. But the ancillary buffer both sides use
-//! is `EXPECTED_ANCILLARY_BUFFER_SIZE`, which is `CMSG_SPACE(8 * 4) + CMSG_SPACE(12)` =
-//! 80 bytes, and an `SCM_RIGHTS` block for n descriptors needs `align8(4n) + 16`. So the
-//! buffer tops out at **16** descriptors, not 253.
+//! `MAX_FDS` is 253, the kernel's `SCM_MAX_FD`, and it needs to mean what it says.
 //!
-//! Above that the send side fails with `ENOSPC`, which is not `WouldBlock`, so it is
-//! reported as `TrySendError::Closed` — the caller concludes the peer is dead. The
-//! receive side has the same undersized buffer, so even a successful send would come back
-//! `MSG_CTRUNC` with descriptors silently dropped.
+//! It did not always. The ancillary buffer was a fixed `EXPECTED_ANCILLARY_BUFFER_SIZE`
+//! — 80 bytes, enough for **16** descriptors — while the inline send path was gated on
+//! `MAX_FDS`. Anything above 16 failed with `ENOSPC`, which is not `WouldBlock`, so it
+//! surfaced as `TrySendError::Closed` and the caller concluded the peer was dead. The
+//! receive side had the same undersized buffer, so a successful send would still have
+//! come back `MSG_CTRUNC` with descriptors silently dropped.
 //!
-//! `descriptors_above_the_inline_buffer` is `#[ignore]`d because it fails on today's
-//! code. It is the regression pin for the fix: sizing the ancillary buffer from the
-//! actual descriptor count.
+//! Now the send buffer is sized from the actual descriptor count and the receive buffer
+//! is sized for `MAX_FDS` up front, so both ends of that boundary are covered here.
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
@@ -25,7 +22,7 @@ struct CountFds {
 }
 
 impl Handler for CountFds {
-    async fn handle(&self, _data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, _data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         // dropping `fds` here is what closes the descriptors the kernel duped into us,
         // so a leak would show up as this test running out of descriptors
         let _ = self.tx.send(fds.len());
@@ -67,7 +64,6 @@ async fn descriptors_within_the_inline_buffer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "fails until the ancillary buffer is sized from the actual fd count (step 4)"]
 async fn descriptors_above_the_inline_buffer() {
     expect_count(&[17, 32, 64, 128, 253]).await;
 }

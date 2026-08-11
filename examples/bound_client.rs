@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 pub struct ReplyHandler(CancellationToken);
 impl Handler for ReplyHandler {
-    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         println!("reply: {}", String::from_utf8_lossy(data));
         self.0.cancel();
     }

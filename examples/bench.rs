@@ -29,7 +29,7 @@ use tokio::sync::mpsc::error::TrySendError;
 const FD_WARN_FRACTION: f64 = 0.80;
 /// how often the watchdog samples /proc
 const FD_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
-/// recv_loop's read buffer in lib.rs; payloads above this get truncated by the kernel
+/// where recv_loop's read buffer starts; it grows if a peer sends something larger
 const RECV_BUF: usize = 8192;
 
 // ---------------------------------------------------------------- /proc helpers
@@ -185,7 +185,7 @@ struct EchoHandler {
 }
 
 impl Handler for EchoHandler {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         if data == b"QUIT" {
             std::process::exit(0);
         }
@@ -271,7 +271,7 @@ struct ReplyHandler {
 }
 
 impl Handler for ReplyHandler {
-    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         self.received.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         let _ = self.tx.send(data.len());
@@ -810,25 +810,39 @@ async fn parent_main(args: Vec<String>) {
 
     // ---- oversize payload behaviour
     header("payload ceiling");
+    println!("  each size is sent three times. a receive buffer too small for a message");
+    println!("  drops it and grows to fit, and this is a round trip — so an oversized");
+    println!("  payload costs one attempt to grow the server's buffer and a second to grow");
+    println!("  the client's before the third gets all the way there and back.");
     for payload in [4096usize, 8192, 8193, 16384, 65536] {
-        // strictly sequential, or a straggler from the previous phase answers for us
-        client.quiesce().await;
         let data = vec![0x41u8; payload];
-        let mut r = 0;
-        let sent_ok = client.send(client.message(&data, 1), &mut r).await;
-        let got = tokio::time::timeout(Duration::from_millis(500), client.rx.recv()).await;
-        match (sent_ok, got) {
-            (true, Ok(Some(n))) if n == payload => println!("  {payload:>6} B  → echoed intact"),
-            (true, Ok(Some(n))) => println!(
-                "  {payload:>6} B  → came back as {n} B — TRUNCATED, {} B lost silently",
-                payload - n
-            ),
-            (true, Ok(None)) => println!("  {payload:>6} B  → reply channel closed"),
-            (true, Err(_)) => println!("  {payload:>6} B  → no reply within 500 ms (dropped)"),
-            (false, _) => println!("  {payload:>6} B  → send failed"),
+        let mut outcome = ["", "", ""];
+        for attempt in &mut outcome {
+            // strictly sequential, or a straggler from the previous phase answers for us
+            client.quiesce().await;
+            let mut r = 0;
+            let sent_ok = client.send(client.message(&data, 1), &mut r).await;
+            let got = tokio::time::timeout(Duration::from_millis(500), client.rx.recv()).await;
+            *attempt = match (sent_ok, got) {
+                (true, Ok(Some(n))) if n == payload => "intact",
+                (true, Ok(Some(_))) => "TRUNCATED",
+                (true, Ok(None)) => "channel closed",
+                (true, Err(_)) => "dropped",
+                (false, _) => "send failed",
+            };
         }
+        let note = match outcome {
+            ["intact", "intact", "intact"] => "fits both buffers as they are",
+            [_, _, "intact"] => "both buffers grew to fit",
+            _ => "STILL not getting through",
+        };
+        println!(
+            "  {payload:>6} B  → {:<9} {:<9} {:<9}  {note}",
+            outcome[0], outcome[1], outcome[2]
+        );
     }
-    println!("  recv_loop's buffer is {RECV_BUF} B; anything larger is the kernel truncating.");
+    println!("  buffers start at {RECV_BUF} B and grow to whatever peers actually send; a message");
+    println!("  that overflows one is reported and dropped, never silently shortened.");
 
     // ---- final resource summary
     header("resource summary");

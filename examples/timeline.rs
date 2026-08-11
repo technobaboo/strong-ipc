@@ -94,7 +94,7 @@ struct EchoHandler {
 }
 
 impl Handler for EchoHandler {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         // first thing, before any of our own work lands in the measurement
         let t1 = now_ns();
 
@@ -156,7 +156,7 @@ struct ReplyHandler {
 }
 
 impl Handler for ReplyHandler {
-    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let t3 = now_ns();
         if data.len() >= HDR {
             let _ = self

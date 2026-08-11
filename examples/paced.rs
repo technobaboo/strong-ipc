@@ -89,7 +89,7 @@ struct EchoHandler {
 }
 
 impl Handler for EchoHandler {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         if data == b"QUIT" {
             std::process::exit(0);
         }
@@ -175,7 +175,7 @@ struct ReplyHandler {
 }
 
 impl Handler for ReplyHandler {
-    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let now = Instant::now();
         if data.len() >= SEQ_BYTES {
             let seq = u64::from_le_bytes(data[..SEQ_BYTES].try_into().unwrap());

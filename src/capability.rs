@@ -7,7 +7,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use tokio::sync::mpsc::error::TrySendError;
-use tokio_seqpacket::UnixSeqpacket;
 
 struct RefInner {
     /// the socket, deliberately *not* registered with the reactor — every inline send is
@@ -50,7 +49,10 @@ impl Ref {
     /// nothing comes back this way, if you want a reply, put a ref of your own on the
     /// message with [`Message::add_ref`]
     pub async fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        Ok(Self::from_seqpacket(UnixSeqpacket::connect(path).await?))
+        // `connect` on an AF_UNIX socket completes without blocking unless the listener's
+        // backlog is full, in which case it reports `WouldBlock` and the caller retries —
+        // the connection is not queued, so there is nothing to wait on
+        Ok(Self::from_fd(wire::connect(path.as_ref())?))
     }
     /// wraps an fd received over `SCM_RIGHTS`
     ///
@@ -60,12 +62,7 @@ impl Ref {
     pub fn from_owned_fd(fd: OwnedFd) -> Self {
         Self::from_fd(fd)
     }
-    pub(crate) fn from_seqpacket(seqpacket: UnixSeqpacket) -> Self {
-        // hand back the reactor registration the socket arrived with; if this ref ever
-        // backs up, the outbox registers a dup of its own
-        Self::from_fd(OwnedFd::from(seqpacket))
-    }
-    fn from_fd(fd: OwnedFd) -> Self {
+    pub(crate) fn from_fd(fd: OwnedFd) -> Self {
         Self {
             inner: Arc::new(RefInner {
                 fd,
@@ -99,7 +96,7 @@ impl Ref {
         // build; leave it to the task so oversized sends fail exactly as they used to
         let inline_ok = message.fds().len() <= wire::MAX_FDS && !backed_up;
         if inline_ok {
-            match wire::try_send_now(self.inner.fd.as_fd(), &message) {
+            match wire::send_now(self.inner.fd.as_fd(), &message) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // socket buffer is full, so fall through and let the task drain it

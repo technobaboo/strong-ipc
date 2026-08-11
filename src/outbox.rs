@@ -8,7 +8,7 @@
 //!
 //! [`Ref`]: crate::Ref
 
-use crate::{message::Message, wire::EXPECTED_ANCILLARY_BUFFER_SIZE};
+use crate::{message::Message, wire::Reactive};
 use std::{
     os::fd::OwnedFd,
     sync::{
@@ -17,7 +17,6 @@ use std::{
     },
 };
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio_seqpacket::{UnixSeqpacket, ancillary::AncillaryMessageWriter, borrow_fd::BorrowFd};
 
 /// how many messages may wait here before a sender is told to back off
 const DEPTH: usize = 8;
@@ -38,19 +37,29 @@ impl Outbox {
         fd: &OwnedFd,
         runtime: Option<&tokio::runtime::Handle>,
     ) -> std::io::Result<Self> {
-        // the drain task needs the socket *in* the reactor, so give it a dup and leave
-        // the `Ref`'s own fd unregistered. both name the same open file description, so a
-        // send on either is a send on the same socket, and ordering between them holds
-        let seqpacket = UnixSeqpacket::try_from(fd.try_clone()?)?;
-        let (sender, receiver) = mpsc::channel(DEPTH);
-        let pending = Arc::new(AtomicUsize::new(0));
         let runtime = runtime
             .cloned()
             .unwrap_or_else(tokio::runtime::Handle::current);
+
+        // the drain task needs the socket *in* the reactor, so give it a dup and leave
+        // the `Ref`'s own fd unregistered. both name the same open file description, so a
+        // send on either is a send on the same socket, and ordering between them holds
+        //
+        // the `enter()` guard is load-bearing: registering with the reactor requires
+        // runtime *context*, and holding a `Handle` is not the same thing. without it a
+        // `send_message` from a non-runtime thread panics with "there is no reactor
+        // running" the moment its socket backs up
+        let socket = {
+            let _guard = runtime.enter();
+            Reactive::new(fd.try_clone()?)?
+        };
+
+        let (sender, receiver) = mpsc::channel(DEPTH);
+        let pending = Arc::new(AtomicUsize::new(0));
         // deliberately not an AbortOnDrop: once the last `Ref` goes, mpsc closes the
         // channel but still drains what's queued before `recv()` gives `None`. aborting
         // would race with in-flight sends and lose them
-        runtime.spawn(Self::drain(receiver, seqpacket, pending.clone()));
+        runtime.spawn(Self::drain(receiver, socket, pending.clone()));
         Ok(Self { sender, pending })
     }
 
@@ -79,20 +88,16 @@ impl Outbox {
 
     async fn drain(
         mut message_rx: mpsc::Receiver<Message>,
-        seqpacket: UnixSeqpacket,
+        socket: Reactive,
         pending: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
-        let mut ancillary_buffer = vec![0_u8; EXPECTED_ANCILLARY_BUFFER_SIZE];
         loop {
             let Some(message) = message_rx.recv().await else {
                 return Ok(());
             };
-
-            let mut writer = AncillaryMessageWriter::new(&mut ancillary_buffer);
-            writer.add_fds(message.fds().iter().map(|f| f.borrow_fd()))?;
-            let result = seqpacket
-                .send_with_ancillary(message.data(), &mut writer)
-                .await;
+            // the same `wire::send_now` the inline fast path uses, with readiness in
+            // front of it — one implementation, so the two paths cannot drift apart
+            let result = socket.send(&message).await;
             // released only now, so the fast path stays shut until this really is on the
             // wire. on error too — the message is gone either way, and leaving the count
             // raised would wedge the fast path forever

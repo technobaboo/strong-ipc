@@ -31,7 +31,7 @@ struct SeqChecker {
 }
 
 impl Handler for SeqChecker {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         self.received.fetch_add(1, Ordering::Relaxed);
         self.fds_seen.fetch_add(fds.len() as u64, Ordering::Relaxed);
 
@@ -146,5 +146,5 @@ async fn main() {
 
 struct NullHandler;
 impl Handler for NullHandler {
-    async fn handle(&self, _d: &mut [u8], _f: FdVec, _c: Option<tokio_seqpacket::UCred>) {}
+    async fn handle(&self, _d: &mut [u8], _f: FdVec, _c: Option<strong_ipc::UCred>) {}
 }

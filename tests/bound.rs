@@ -19,7 +19,7 @@ struct Echo {
 }
 
 impl Handler for Echo {
-    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         self.served.fetch_add(1, Ordering::Relaxed);
         let Some(fd) = fds.into_iter().next() else {
             return;
@@ -35,7 +35,7 @@ struct Collector {
     tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 }
 impl Handler for Collector {
-    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<tokio_seqpacket::UCred>) {
+    async fn handle(&self, data: &mut [u8], _fds: FdVec, _creds: Option<strong_ipc::UCred>) {
         let _ = self.tx.send(data.to_vec());
     }
 }
