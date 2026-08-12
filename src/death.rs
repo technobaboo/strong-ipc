@@ -27,7 +27,7 @@ pub(crate) struct Death {
 
 impl Death {
 	pub(crate) fn is_dead(&self) -> bool {
-		self.dead.load(Ordering::Acquire)
+		self.dead.load(Ordering::Relaxed)
 	}
 
 	/// parks until [`Death::declare`], or returns straight away if it already happened
@@ -46,7 +46,7 @@ impl Death {
 	}
 
 	fn declare(&self) {
-		self.dead.store(true, Ordering::Release);
+		self.dead.store(true, Ordering::Relaxed);
 		self.notify.notify_waiters();
 	}
 

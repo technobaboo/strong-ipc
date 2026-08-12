@@ -72,7 +72,7 @@ impl Outbox {
 	/// while this is true the inline fast path must stay shut, or a new message would
 	/// overtake one already queued
 	pub(crate) fn is_backed_up(&self) -> bool {
-		self.pending.load(Ordering::Acquire) != 0
+		self.pending.load(Ordering::Relaxed) != 0
 	}
 
 	/// queue `message` behind whatever is already waiting, or give it straight back
@@ -80,11 +80,11 @@ impl Outbox {
 	pub(crate) fn push(&self, message: Message) -> Result<(), TrySendError> {
 		// claimed before the push so a concurrent fast path sees us coming and queues
 		// behind us instead of jumping the line
-		self.pending.fetch_add(1, Ordering::AcqRel);
+		self.pending.fetch_add(1, Ordering::Relaxed);
 		match self.sender.try_send(message) {
 			Ok(()) => Ok(()),
 			Err(e) => {
-				self.pending.fetch_sub(1, Ordering::AcqRel);
+				self.pending.fetch_sub(1, Ordering::Relaxed);
 				Err(match e {
 					mpsc::error::TrySendError::Full(m) => TrySendError::Full(m),
 					mpsc::error::TrySendError::Closed(m) => TrySendError::Closed(m),
@@ -102,7 +102,7 @@ impl Outbox {
 		let Ok(permit) = self.sender.reserve().await else {
 			return Err(SendError::Closed(message));
 		};
-		self.pending.fetch_add(1, Ordering::AcqRel);
+		self.pending.fetch_add(1, Ordering::Relaxed);
 		permit.send(message);
 		Ok(())
 	}
@@ -122,7 +122,7 @@ impl Outbox {
 			// released only now, so the fast path stays shut until this really is on the
 			// wire. on error too — the message is gone either way, and leaving the count
 			// raised would wedge the fast path forever
-			pending.fetch_sub(1, Ordering::AcqRel);
+			pending.fetch_sub(1, Ordering::Relaxed);
 			result?;
 		}
 	}

@@ -125,7 +125,7 @@ impl FdWatch {
 			}
 		}
 		if (mine >= self.threshold || theirs >= self.threshold)
-			&& !self.tripped.swap(true, Ordering::SeqCst)
+			&& !self.tripped.swap(true, Ordering::Relaxed)
 		{
 			self.abort(mine, theirs, "descriptor budget exceeded");
 		}
