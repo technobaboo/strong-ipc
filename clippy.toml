@@ -1,0 +1,9 @@
+# `Ref` is interior-mutable — it caches its outbox and its death watch in `OnceLock`s —
+# so `clippy::mutable_key_type` objects to it keying a `HashMap`. Neither of those is
+# reachable from `Hash` or `Eq`, which compare the address of the shared `RefInner` and
+# nothing else, so a `Ref` cannot change its own hash and the lint has nothing to warn
+# about here. Keying a map by peer is the reason `Ref` implements `Hash` at all.
+#
+# this only covers *this* crate; a downstream crate keeping a `HashMap<Ref, _>` needs the
+# same line in its own clippy.toml, which `Ref`'s documentation says.
+ignore-interior-mutability = ["core::cell::Cell", "bytes::Bytes", "strong_ipc::Ref"]

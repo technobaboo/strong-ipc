@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# the registry behind `Ref` interning, which is touched by every `Ref` construction and
+# every `Ref` drop. sharded so those two don't serialise against each other on one lock
+dashmap = "6.2.1"
 # `event` is only for the zero-timeout `ppoll` behind `Ref::is_dead` — asking the kernel
 # whether a socket's peer is gone without registering it with the reactor; `process` is
-# only for the rlimit pair behind `maximize_fd_limit`
-rustix = { version = "1.1.4", features = ["net", "event", "process"] }
+# only for the rlimit pair behind `maximize_fd_limit`; `fs` is only for the `fstat` that
+# gives a socket the identity the `Ref` registry keys on
+rustix = { version = "1.1.4", features = ["net", "event", "process", "fs"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
 # `net` is what provides tokio::io::unix::AsyncFd, which the outbox and the receive
 # loop use to wait on socket readiness; `sync` is the mpsc behind the outbox and the

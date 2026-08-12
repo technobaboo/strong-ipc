@@ -275,6 +275,10 @@ struct Stats {
 	p999: f64,
 	max: f64,
 	mean: f64,
+	/// every sample, sorted, in ns — kept so a phase can also be drawn as a histogram.
+	/// percentiles hide the shape, and the shape is where scheduler tails and
+	/// per-capability costs actually show up
+	samples: Vec<u64>,
 }
 
 fn summarize(mut samples: Vec<u64>) -> Stats {
@@ -291,6 +295,45 @@ fn summarize(mut samples: Vec<u64>) -> Stats {
 		p999: at(0.999),
 		max: *samples.last().unwrap() as f64 / 1000.0,
 		mean,
+		samples,
+	}
+}
+
+/// √2-spaced buckets from the fastest sample up, drawn as bars
+///
+/// log spacing keeps a long tail readable next to a tight mode without the tail
+/// squashing everything else into one row
+fn histogram(title: &str, samples: &[u64]) {
+	if samples.is_empty() {
+		return;
+	}
+	let lo = (samples[0] as f64 / 1000.0).max(0.1);
+	let hi = (*samples.last().unwrap() as f64 / 1000.0).max(lo * 1.001);
+	let step = std::f64::consts::SQRT_2;
+	let buckets = ((hi / lo).log(step).ceil() as usize + 1).clamp(1, 24);
+	let mut counts = vec![0usize; buckets];
+	for s in samples {
+		let us = *s as f64 / 1000.0;
+		let i = ((us / lo).log(step).floor() as isize).clamp(0, buckets as isize - 1) as usize;
+		counts[i] += 1;
+	}
+	let peak = counts.iter().copied().max().unwrap_or(1).max(1);
+	let total = samples.len() as f64;
+	println!("  {title}  (n = {})", samples.len());
+	for (i, count) in counts.iter().enumerate() {
+		let edge = lo * step.powi(i as i32);
+		let next = edge * step;
+		// sub-1% buckets still get a mark, so the tail stays visible
+		let bar = if *count == 0 {
+			0
+		} else {
+			((*count * 44) / peak).max(1)
+		};
+		println!(
+			"   {edge:>7.2}–{next:>7.2} µs │{:<44}│ {count:>7}  {:>5.1}%",
+			"█".repeat(bar),
+			*count as f64 / total * 100.0
+		);
 	}
 }
 
@@ -651,6 +694,8 @@ async fn parent_main(args: Vec<String>) {
 		"payload", "p50", "p90", "p99", "p99.9", "max", "mean"
 	);
 	let mut raw_p50 = std::collections::BTreeMap::new();
+	// sample sets worth drawing in full, collected as their phases run
+	let mut dists: Vec<(String, Vec<u64>)> = Vec::new();
 	{
 		let mut rbuf = vec![0u8; 65536];
 		for payload in [8usize, 1024, 8192] {
@@ -672,6 +717,9 @@ async fn parent_main(args: Vec<String>) {
 				"  {:>8}  {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>9.2}",
 				payload, s.p50, s.p90, s.p99, s.p999, s.max, s.mean
 			);
+			if payload == 8 {
+				dists.push(("raw seqpacket, 8 B".to_string(), s.samples));
+			}
 		}
 	}
 
@@ -692,6 +740,9 @@ async fn parent_main(args: Vec<String>) {
 			"  {:>8}  {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>9.2}  {:>7.2}µs{vs_raw}",
 			payload, s.p50, s.p90, s.p99, s.p999, s.max, s.mean, cpu_us
 		);
+		if payload == 8 {
+			dists.push(("strong-ipc, 8 B, data only".to_string(), s.samples));
+		}
 	}
 
 	// ---- latency, one capability per message
@@ -707,6 +758,9 @@ async fn parent_main(args: Vec<String>) {
 			"  {:>8}  {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>9.2}  {:>7.2}µs",
 			payload, s.p50, s.p90, s.p99, s.p999, s.max, s.mean, cpu_us
 		);
+		if payload == 8 {
+			dists.push(("strong-ipc, 8 B, one capability".to_string(), s.samples));
+		}
 	}
 
 	// ---- latency, many capabilities per message
@@ -727,6 +781,16 @@ async fn parent_main(args: Vec<String>) {
 			watch.peak_self.load(Ordering::Relaxed),
 			watch.peak_child.load(Ordering::Relaxed)
 		);
+		if caps == 32 {
+			dists.push(("strong-ipc, 8 B, 32 capabilities".to_string(), s.samples));
+		}
+	}
+
+	// ---- the shape behind the percentiles
+	header("latency distributions (√2-spaced buckets)");
+	for (title, samples) in &dists {
+		histogram(title, samples);
+		println!();
 	}
 
 	// ---- throughput
