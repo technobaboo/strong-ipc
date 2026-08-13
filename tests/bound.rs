@@ -104,8 +104,8 @@ async fn binding_an_occupied_path_fails_rather_than_clobbering() {
 	);
 	match second {
 		Err(e) => assert_eq!(
-			e.kind(),
-			std::io::ErrorKind::AddrInUse,
+			e.io_kind(),
+			Some(std::io::ErrorKind::AddrInUse),
 			"expected AddrInUse, got {e:?}"
 		),
 		Ok(_) => panic!("the second bind clobbered the first"),

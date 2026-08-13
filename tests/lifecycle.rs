@@ -47,6 +47,16 @@ impl Handler for Gated {
 	}
 }
 
+#[derive(Default)]
+struct Counting {
+	seen: std::sync::atomic::AtomicUsize,
+}
+impl Handler for Counting {
+	async fn handle(&self, _d: &mut [u8], _f: FdVec, _c: Option<strong_ipc::UCred>) {
+		self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	}
+}
+
 struct Null;
 impl Handler for Null {
 	async fn handle(&self, _d: &mut [u8], _f: FdVec, _c: Option<strong_ipc::UCred>) {}
@@ -317,5 +327,51 @@ async fn a_node_reports_a_receive_loop_that_stopped_on_its_own() {
 	assert!(
 		node_ref.is_dead(),
 		"a node that stopped receiving left its Refs thinking they could still reach it"
+	);
+}
+
+/// [`Node::to_service`] hands the node's lifetime over to its refs
+///
+/// the point of the method is that it adds nothing: no task, no registry, no stored node.
+/// The receive loop was always the thing holding the handler and always ended on its own
+/// hangup — dropping the node without its abort handle armed is the entire mechanism, so
+/// what this checks is that the loop really does outlive the `Node` value and really does
+/// still stop when the last `Ref` goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_outlives_its_node_and_dies_with_its_refs() {
+	let handler = Arc::new(Counting::default());
+	let (node, node_ref) = Node::new_raw(handler.clone()).unwrap();
+
+	node.to_service();
+
+	// the node value is gone, yet the loop is still there to be sent to
+	node_ref.send(numbered(1)).await.unwrap();
+	for _ in 0..100 {
+		if handler.seen.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert_eq!(
+		handler.seen.load(std::sync::atomic::Ordering::Relaxed),
+		1,
+		"a node moved to a service stopped receiving"
+	);
+	assert!(!node_ref.is_dead(), "the service hung up on its own ref");
+
+	// and the refs are now the only thing keeping it: the loop's share of the handler is
+	// dropped when it ends, leaving ours as the last one
+	assert_eq!(Arc::strong_count(&handler), 2);
+	drop(node_ref);
+	for _ in 0..100 {
+		if Arc::strong_count(&handler) == 1 {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert_eq!(
+		Arc::strong_count(&handler),
+		1,
+		"the service kept its handler alive after its last Ref went away"
 	);
 }

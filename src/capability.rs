@@ -23,7 +23,7 @@ use std::{
 /// back out once it is free, so an entry that outlived its socket would not merely be
 /// stale, it would eventually name somebody else's — which is the whole reason
 /// [`RefInner::drop`] unfiles itself before its descriptor closes.
-type SocketId = (u64, u64);
+pub(crate) type SocketId = (u64, u64);
 
 /// every live `Ref`, by the socket it sends to
 ///
@@ -213,6 +213,31 @@ impl Ref {
 		Arc::ptr_eq(&self.inner, &other.inner)
 	}
 
+	/// this capability's socket identity, or `None` if `fstat` failed when it was built
+	#[cfg(feature = "local-handlers")]
+	pub(crate) fn socket_id(&self) -> Option<SocketId> {
+		self.inner.id
+	}
+
+	/// the handler behind this capability, if it leads to a node in *this* process
+	///
+	/// the shortcut a process that is both ends of a capability is entitled to: a ref it
+	/// handed out and got back is recognised on arrival, so the handler is a hash lookup
+	/// away and nothing has to go over the wire to reach it. See [`crate::local`] for why
+	/// this is behind a feature.
+	///
+	/// `None` covers every way this can fail to be a handler you can have, without
+	/// distinguishing them: the ref leads to another process, its node is gone, or it is
+	/// live and simply isn't an `H`. Nothing here is a capability check — a ref you were
+	/// handed is authority to *send*, and if it happens to lead home this hands you the
+	/// receiving side of it, so treat the `Arc<H>` as you would the node's own.
+	///
+	/// costs one sharded hash lookup, a `Weak` upgrade, and a downcast.
+	#[cfg(feature = "local-handlers")]
+	pub fn local_handler<H: crate::Handler>(&self) -> Option<Arc<H>> {
+		crate::local::local_handler(self.inner.id?)
+	}
+
 	/// what `Hash` and `Eq` agree to treat as this capability's identity
 	///
 	/// the address of the shared `RefInner`, which is only meaningful while the `Ref` is
@@ -253,6 +278,19 @@ impl Eq for Ref {}
 impl std::hash::Hash for Ref {
 	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 		std::ptr::hash(self.identity(), state);
+	}
+}
+
+/// prints the identity `Hash` and `Eq` agree on, so two refs logging the same handle are
+/// the same capability and two logging different ones are not
+///
+/// that address is both the most and the least this can honestly say: the socket's inode
+/// names an open file description, which tells a reader nothing they could act on, and
+/// the payloads that went through it are gone. Deliberately says nothing about liveness —
+/// answering that is a syscall, and `Debug` should not make one
+impl std::fmt::Debug for Ref {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "Ref({:p})", self.identity())
 	}
 }
 

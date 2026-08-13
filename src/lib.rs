@@ -72,19 +72,25 @@
 //! keeping it — a node holding a `Ref` to itself could never see its own socket hang up.
 //! So dropping the last `Ref` ends the node's receive loop, and [`Node::is_dead`] says
 //! so.
+//!
+//! That is also all [`Node::to_service`] is: a node whose handle you gave up, left to be
+//! ended by its own last `Ref` rather than by you dropping it. It stores nothing and
+//! spawns nothing, because the receive loop was always the thing holding the handler.
 
 #![forbid(unsafe_code)]
 
 mod capability;
 mod death;
 mod error;
+#[cfg(feature = "local-handlers")]
+mod local;
 mod message;
 mod node;
 mod outbox;
 pub mod wire;
 
 pub use capability::Ref;
-pub use error::{SendError, TrySendError};
+pub use error::{NodeError, SendError, TrySendError};
 pub use message::{FdVec, Message};
 pub use node::{BoundNode, Handler, Node};
 pub use wire::{

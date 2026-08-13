@@ -3,6 +3,13 @@ name = "strong-ipc"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# `Ref::local_handler`: reaching the handler behind a ref that leads to one of our own
+# nodes, for a process that is both ends of a capability. off by default — it is a
+# deliberate hole in the abstraction, and it costs a map entry per node that a process
+# never asking the question shouldn't pay for
+local-handlers = []
+
 [dependencies]
 # the registry behind `Ref` interning, which is touched by every `Ref` construction and
 # every `Ref` drop. sharded so those two don't serialise against each other on one lock

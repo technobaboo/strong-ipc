@@ -2,6 +2,7 @@
 
 use crate::{
 	Ref,
+	error::NodeError,
 	death::Death,
 	message::FdVec,
 	wire::{self, MAX_ANCILLARY_BUFFER_SIZE, MAX_MESSAGE_SIZE, Reactive},
@@ -46,25 +47,36 @@ impl<H: Handler> Node<H> {
 	#[must_use = "the Ref is the only way to reach this node — a Node holds no capability \
                   to itself, so dropping the Ref here hangs the node's socket up \
                   immediately and it will never receive anything"]
-	pub fn new(handler: H) -> std::io::Result<(Node<H>, Ref)> {
+	pub fn new(handler: H) -> Result<(Node<H>, Ref), NodeError> {
 		Node::new_raw(Arc::new(handler))
 	}
 	/// [`Node::new`] for a handler you already share elsewhere
 	#[must_use = "the Ref is the only way to reach this node — a Node holds no capability \
                   to itself, so dropping the Ref here hangs the node's socket up \
                   immediately and it will never receive anything"]
-	pub fn new_raw(handler: Arc<H>) -> std::io::Result<(Node<H>, Ref)> {
+	pub fn new_raw(handler: Arc<H>) -> Result<(Node<H>, Ref), NodeError> {
 		let (tx, rx) = wire::socketpair()?;
 		wire::enable_credentials(rx.as_fd());
 		// built out here, not in the task: `AsyncFd::new` needs runtime context, and
 		// failing to register should be this call's error rather than a task that dies
 		let socket = Reactive::new(rx)?;
 		let death = Arc::new(Death::default());
+		// built before the task rather than at the end, because the entry filed under
+		// `local-handlers` is keyed on this ref's socket identity
+		let node_ref = Ref::from_fd(tx);
+		#[cfg(feature = "local-handlers")]
+		let local = node_ref
+			.socket_id()
+			.map(|id| crate::local::LocalEntry::file(id, &handler));
 		let task = tokio::spawn({
 			let handler = handler.clone();
 			let tombstone = death.tombstone();
 			async move {
 				let _tombstone = tombstone;
+				// rides with the tombstone for the same reason: the receive loop is what
+				// ends on every path that ends this node, `to_service` included
+				#[cfg(feature = "local-handlers")]
+				let _local = local;
 				recv_loop(handler, socket).await
 			}
 		});
@@ -74,7 +86,7 @@ impl<H: Handler> Node<H> {
 				death,
 				_task: AbortOnDrop::new(task.abort_handle()),
 			},
-			Ref::from_fd(tx),
+			node_ref,
 		))
 	}
 
@@ -104,7 +116,7 @@ impl<H: Handler> Node<H> {
 	/// long as somebody can still reach it:
 	///
 	/// ```no_run
-	/// # async fn f<H: strong_ipc::Handler>(handler: H) -> std::io::Result<()> {
+	/// # async fn f<H: strong_ipc::Handler>(handler: H) -> Result<(), strong_ipc::NodeError> {
 	/// let (node, capability) = strong_ipc::Node::new(handler)?;
 	/// hand_out(capability);
 	/// node.death_notification().await; // returns once the last Ref is dropped
@@ -116,11 +128,59 @@ impl<H: Handler> Node<H> {
 	}
 	/// the handler this node is feeding
 	///
+	/// hands back the `Arc` rather than a plain `&H` so a caller can clone out a share of
+	/// the handler the receive loop is already holding, without the node having to have
+	/// been built from an `Arc` they kept a copy of
+	///
 	/// deliberately a named method rather than a `Deref` impl: a `Node` is not a handler,
 	/// and quietly putting every one of `H`'s methods onto it hides which of the two you
-	/// are actually talking to
-	pub fn handler(&self) -> &H {
+	/// are actually talking to. Worse with `Arc<H>` as the target, since a `Node` is not
+	/// `Clone` — `node.clone()` would resolve through the deref and hand back a share of
+	/// the handler instead of failing to compile
+	pub fn handler(&self) -> &Arc<H> {
 		&self.handler
+	}
+
+	/// gives up the handle and lets this node live exactly as long as somebody can reach it
+	///
+	/// the normal deal is that a `Node` is the node: drop it and the socket hangs up, so a
+	/// caller has to park it somewhere for as long as it should keep serving. That is
+	/// backwards for anything handed out and then forgotten about, where the refs are the
+	/// only thing that should decide how long it lives.
+	///
+	/// this costs no task and no bookkeeping, because there is nothing to store. The
+	/// receive loop already owns its own share of the handler and its own tombstone, and
+	/// already ends on its own when the last `Ref` hangs the socket up — the sole reason it
+	/// stops earlier is the abort handle in here. Dropping the node without that handle
+	/// armed *is* the whole feature: the loop keeps running, the handler stays alive
+	/// underneath it, and both go when the refs do.
+	///
+	/// there is no getting it back afterwards, and nothing to abort it early with, so the
+	/// refs really are the only lifetime left. Keep the node instead if you need either.
+	///
+	/// ```no_run
+	/// # async fn f<H: strong_ipc::Handler>(handler: H) -> Result<(), strong_ipc::NodeError> {
+	/// let (node, capability) = strong_ipc::Node::new(handler)?;
+	/// node.to_service(); // no longer ours to keep alive
+	/// hand_out(capability); // …this is
+	/// # Ok(()) }
+	/// # fn hand_out(_: strong_ipc::Ref) {}
+	/// ```
+	pub fn to_service(self) {
+		// `Node` has no `Drop` of its own, so the abort handle can be moved out and
+		// disarmed on its way past. `handler` and `death` then drop as usual — the task
+		// holds a clone of each, which is what keeps them alive
+		drop(self._task.detach());
+	}
+}
+
+/// `dead` is the one thing about a node worth printing, and unlike [`Ref`]'s it is free —
+/// [`Node::is_dead`] is an atomic load, not a syscall
+impl<H: Handler> std::fmt::Debug for Node<H> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Node")
+			.field("dead", &self.is_dead())
+			.finish_non_exhaustive()
 	}
 }
 
@@ -183,10 +243,10 @@ impl<H: Handler> BoundNode<H> {
 	/// won't clobber a path that already exists, a stale socket left by a crash fails
 	/// with `AddrInUse` instead, since replacing it could yank the path out from under
 	/// something still alive
-	pub fn bind<P: AsRef<Path>>(path: P, handler: H) -> std::io::Result<Self> {
+	pub fn bind<P: AsRef<Path>>(path: P, handler: H) -> Result<Self, NodeError> {
 		Self::bind_raw(path, Arc::new(handler))
 	}
-	pub fn bind_raw<P: AsRef<Path>>(path: P, handler: Arc<H>) -> std::io::Result<Self> {
+	pub fn bind_raw<P: AsRef<Path>>(path: P, handler: Arc<H>) -> Result<Self, NodeError> {
 		let path = path.as_ref();
 		let listener = Reactive::new(wire::bind(path)?)?;
 		let task = tokio::spawn(Self::task(listener, handler.clone()));
@@ -198,8 +258,8 @@ impl<H: Handler> BoundNode<H> {
 	}
 	/// the handler shared by every connection this node accepts
 	///
-	/// see [`Node::handler`] for why this isn't a `Deref`
-	pub fn handler(&self) -> &H {
+	/// see [`Node::handler`] for why this isn't a `Deref` and why it's the `Arc`
+	pub fn handler(&self) -> &Arc<H> {
 		&self.handler
 	}
 	async fn task(listener: Reactive, handler: Arc<H>) -> std::io::Result<()> {

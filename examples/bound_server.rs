@@ -37,7 +37,7 @@ pub async fn main() {
 	let path = socket_path();
 	let node = match BoundNode::bind(&path, EchoHandler) {
 		Ok(node) => node,
-		Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+		Err(e) if e.io_kind() == Some(std::io::ErrorKind::AddrInUse) => {
 			eprintln!("{} is already in use.", path.display());
 			eprintln!("Another server is running, or a previous one was killed before it could");
 			eprintln!("clean up — in which case remove the stale socket file and try again.");

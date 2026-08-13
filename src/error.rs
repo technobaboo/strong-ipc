@@ -12,6 +12,60 @@
 use crate::{Message, wire::MAX_MESSAGE_SIZE};
 use std::fmt;
 
+/// a node could not be stood up
+///
+/// every way this currently fails is the kernel refusing something — a socket pair, a
+/// descriptor, a path to bind, registering with the reactor — so today it is an
+/// [`std::io::Error`] and nothing else. It is a `#[non_exhaustive]` enum rather than a
+/// newtype so the failures that are *not* the kernel's can be split out later without
+/// breaking every caller matching on it, and it converts both ways with `io::Error` so
+/// neither choice is load-bearing at a call site yet.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum NodeError {
+	Io(std::io::Error),
+}
+
+impl NodeError {
+	/// the kernel's reason, when the kernel was the one to refuse
+	///
+	/// spares a caller a `match` with a wildcard arm on a `#[non_exhaustive]` enum, which
+	/// is what asking "was this `AddrInUse`?" would otherwise cost outside this crate
+	pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+		match self {
+			NodeError::Io(e) => Some(e.kind()),
+		}
+	}
+}
+
+impl From<std::io::Error> for NodeError {
+	fn from(e: std::io::Error) -> Self {
+		NodeError::Io(e)
+	}
+}
+/// so a caller whose own signature is still `io::Result` keeps working with `?`
+impl From<NodeError> for std::io::Error {
+	fn from(e: NodeError) -> Self {
+		match e {
+			NodeError::Io(e) => e,
+		}
+	}
+}
+impl fmt::Display for NodeError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			NodeError::Io(e) => write!(f, "could not stand up a node: {e}"),
+		}
+	}
+}
+impl std::error::Error for NodeError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			NodeError::Io(e) => Some(e),
+		}
+	}
+}
+
 /// [`Ref::send`] could not deliver the message
 ///
 /// [`Ref::send`]: crate::Ref::send
