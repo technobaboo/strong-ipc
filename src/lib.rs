@@ -89,7 +89,7 @@ mod node;
 mod outbox;
 pub mod wire;
 
-pub use capability::Ref;
+pub use capability::{Ref, WeakRef};
 pub use error::{NodeError, SendError, TrySendError};
 pub use message::{FdVec, Message};
 pub use node::{BoundNode, Handler, Node};
