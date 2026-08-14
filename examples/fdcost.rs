@@ -27,7 +27,7 @@ use std::{
 	},
 	time::{Duration, Instant},
 };
-use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
+use strong_ipc::{FdVec, Handler, Message, Node, Ref, RefFsBinding};
 
 const ITERS: usize = 50_000;
 const WARMUP: usize = 5_000;
@@ -271,15 +271,13 @@ fn raw_path(p: &Path) -> PathBuf {
 }
 
 async fn server_main(path: PathBuf) {
-	let _node = BoundNode::bind(
-		&path,
-		EchoHandler {
-			cached: Mutex::new(None),
-			fds_seen: AtomicU64::new(0),
-			refs_built: AtomicU64::new(0),
-		},
-	)
-	.expect("bind");
+	let (_node, node_ref) = Node::new(EchoHandler {
+		cached: Mutex::new(None),
+		fds_seen: AtomicU64::new(0),
+		refs_built: AtomicU64::new(0),
+	})
+	.expect("node");
+	let _ref_binding = RefFsBinding::new(node_ref, &path).expect("binding");
 
 	// plain tokio-seqpacket echo for rung 2, closing received fds like the raw child does
 	let rp = raw_path(&path);

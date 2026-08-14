@@ -4,14 +4,16 @@ use crate::{
 	error::{SendError, TrySendError},
 	message::Message,
 	outbox::Outbox,
-	wire,
+	wire::{self, Reactive},
 };
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::{
+	mem::MaybeUninit,
 	os::fd::{AsFd, BorrowedFd, OwnedFd},
 	path::Path,
 	sync::{Arc, LazyLock, OnceLock, Weak},
 };
+use tokio_util::task::AbortOnDrop;
 
 /// a socket's identity as the kernel sees it: the device its inode lives on, and the inode
 ///
@@ -131,6 +133,27 @@ impl Drop for RefInner {
 		REFS.remove_if(&id, |_, existing| existing.strong_count() == 0);
 	}
 }
+/// Binding a Ref to the file system
+/// this does not handle lock files or file cleanup
+pub struct RefFsBinding {
+	_task: AbortOnDrop,
+}
+impl RefFsBinding {
+	pub fn new(node_ref: Ref, path: impl AsRef<Path>) -> std::io::Result<Self> {
+		let accept_fd = Reactive::new(wire::bind(path.as_ref())?)?;
+		let _task = AbortOnDrop::new(
+			tokio::spawn(async move {
+				while let Ok(fd) = accept_fd.accept().await.and_then(Reactive::new) {
+					let mut message = Message::from_data(vec![]);
+					message.add_ref(&node_ref);
+					_ = fd.send(&message).await;
+				}
+			})
+			.abort_handle(),
+		);
+		Ok(Self { _task })
+	}
+}
 
 /// a capability to send to one node
 ///
@@ -150,7 +173,21 @@ impl Ref {
 		// `connect` on an AF_UNIX socket completes without blocking unless the listener's
 		// backlog is full, in which case it reports `WouldBlock` and the caller retries —
 		// the connection is not queued, so there is nothing to wait on
-		Ok(Self::from_fd(wire::connect(path.as_ref())?))
+        // TODO: retry this with a wait?
+		let fd = wire::connect(path.as_ref()).and_then(Reactive::new)?;
+		let mut ancillary = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+		let fd = fd
+			.recv(&mut [], &mut ancillary)
+			.await?
+			.fds
+			.into_iter()
+			.next()
+			.ok_or(std::io::Error::new(
+				std::io::ErrorKind::UnexpectedEof,
+				"Failed to read Ref fd",
+			))?;
+
+		Ok(Self::from_fd(fd))
 	}
 	/// wraps an fd received over `SCM_RIGHTS`
 	///

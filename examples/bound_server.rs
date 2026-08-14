@@ -5,7 +5,7 @@
 //! every capability after that rides along as an fd
 
 use std::path::PathBuf;
-use strong_ipc::{BoundNode, FdVec, Handler, Message, Ref};
+use strong_ipc::{FdVec, Handler, Message, Node, Ref, RefFsBinding};
 
 pub struct EchoHandler;
 impl Handler for EchoHandler {
@@ -35,9 +35,10 @@ fn socket_path() -> PathBuf {
 #[tokio::main(flavor = "current_thread")]
 pub async fn main() {
 	let path = socket_path();
-	let node = match BoundNode::bind(&path, EchoHandler) {
+	let (node, node_ref) = Node::new(EchoHandler).expect("failed to create node");
+	let _ref_binding = match RefFsBinding::new(node_ref, &path) {
 		Ok(node) => node,
-		Err(e) if e.io_kind() == Some(std::io::ErrorKind::AddrInUse) => {
+		Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
 			eprintln!("{} is already in use.", path.display());
 			eprintln!("Another server is running, or a previous one was killed before it could");
 			eprintln!("clean up — in which case remove the stale socket file and try again.");

@@ -4,7 +4,7 @@
 //! binding — see `bound_server`/`bound_client` for that
 
 use std::time::Duration;
-use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
+use strong_ipc::{FdVec, Handler, Message, Node, Ref, RefFsBinding};
 use tokio_util::sync::CancellationToken;
 
 pub struct EchoHandler;
@@ -28,7 +28,8 @@ impl Handler for EchoReplyHandler {
 #[tokio::main(flavor = "current_thread")]
 pub async fn main() {
 	let path = std::env::temp_dir().join(format!("strong-ipc-echo-{}.sock", std::process::id()));
-	let _echo_node = BoundNode::bind(&path, EchoHandler).unwrap();
+	let (_echo_node,node_ref) = Node::new(EchoHandler).unwrap();
+	let _ref_binding = RefFsBinding::new(node_ref, &path).unwrap();
 
 	let echo_ref = Ref::connect(&path).await.unwrap();
 

@@ -11,10 +11,8 @@ use rustix::net::UCred;
 use std::{
 	mem::MaybeUninit,
 	os::fd::AsFd,
-	path::{Path, PathBuf},
 	sync::Arc,
 };
-use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDrop;
 
 pub trait Handler: Send + Sync + 'static {
@@ -219,65 +217,5 @@ async fn recv_loop<H: Handler>(handler: Arc<H>, socket: Reactive) -> std::io::Re
 		handler
 			.handle(&mut buf[..received.bytes], received.fds, received.creds)
 			.await;
-	}
-}
-
-/// a node listening on a path instead of a socketpair
-///
-/// caps have a bootstrap problem: if the only way to get a ref is someone handing you an
-/// fd, two unrelated processes can never meet. a path is the one name that isn't itself a
-/// capability, so it's the door you knock on before you have any
-///
-/// accepted conns only receive, no ref back out, peers pass one in-band with
-/// [`crate::Message::add_ref`] if they want a reply. they all share the one handler and
-/// die with the boundnode
-pub struct BoundNode<H: Handler> {
-	handler: Arc<H>,
-	/// we made this socket file, so it's ours to unlink again on drop
-	path: PathBuf,
-	_accept_task: AbortOnDrop,
-}
-impl<H: Handler> BoundNode<H> {
-	/// binds a socket at `path`, unlinked again on drop
-	///
-	/// won't clobber a path that already exists, a stale socket left by a crash fails
-	/// with `AddrInUse` instead, since replacing it could yank the path out from under
-	/// something still alive
-	pub fn bind<P: AsRef<Path>>(path: P, handler: H) -> Result<Self, NodeError> {
-		Self::bind_raw(path, Arc::new(handler))
-	}
-	pub fn bind_raw<P: AsRef<Path>>(path: P, handler: Arc<H>) -> Result<Self, NodeError> {
-		let path = path.as_ref();
-		let listener = Reactive::new(wire::bind(path)?)?;
-		let task = tokio::spawn(Self::task(listener, handler.clone()));
-		Ok(Self {
-			handler,
-			path: path.to_owned(),
-			_accept_task: AbortOnDrop::new(task.abort_handle()),
-		})
-	}
-	/// the handler shared by every connection this node accepts
-	///
-	/// see [`Node::handler`] for why this isn't a `Deref` and why it's the `Arc`
-	pub fn handler(&self) -> &Arc<H> {
-		&self.handler
-	}
-	async fn task(listener: Reactive, handler: Arc<H>) -> std::io::Result<()> {
-		// lives in the task and not the boundnode so it needs no locking, killing this
-		// task drops the set, and every connection with it
-		let mut connections = JoinSet::new();
-		loop {
-			let fd = listener.accept().await?;
-			// set per connection: SO_PASSCRED is not inherited from the listener
-			wire::enable_credentials(fd.as_fd());
-			// clear out whoever hung up since, so this doesn't grow forever
-			while connections.try_join_next().is_some() {}
-			connections.spawn(recv_loop(handler.clone(), Reactive::new(fd)?));
-		}
-	}
-}
-impl<H: Handler> Drop for BoundNode<H> {
-	fn drop(&mut self) {
-		let _ = std::fs::remove_file(&self.path);
 	}
 }

@@ -22,7 +22,7 @@ use std::{
 	},
 	time::{Duration, Instant},
 };
-use strong_ipc::{BoundNode, FdVec, Handler, MAX_MESSAGE_SIZE, Message, Node, Ref, TrySendError};
+use strong_ipc::{FdVec, Handler, MAX_MESSAGE_SIZE, Message, Node, Ref, RefFsBinding, TrySendError};
 
 /// stop the run once either side is using this much of its descriptor budget
 const FD_WARN_FRACTION: f64 = 0.80;
@@ -208,13 +208,13 @@ impl Handler for EchoHandler {
 }
 
 async fn server_main(path: PathBuf) {
-	let _node = BoundNode::bind(
-		&path,
+	let (_node,node_ref) = Node::new(
 		EchoHandler {
 			cached: Mutex::new(None),
 		},
 	)
-	.expect("server: bind failed");
+	.expect("server: node creation failed");
+	let _ref_binding = RefFsBinding::new(node_ref, &path).expect("server: bind failed");
 	// a second listener that skips strong-ipc entirely, so the client can measure what
 	// the same kernel primitive costs with nothing layered on top
 	tokio::spawn(raw_echo(raw_path(&path)));

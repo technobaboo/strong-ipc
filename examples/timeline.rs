@@ -52,7 +52,7 @@ use std::{
 	sync::Mutex,
 	time::{Duration, Instant},
 };
-use strong_ipc::{BoundNode, FdVec, Handler, Message, Node, Ref};
+use strong_ipc::{FdVec, Handler, Message, Node, Ref, RefFsBinding};
 
 /// recv_loop's read buffer in lib.rs; payloads above this get truncated by the kernel
 const MAX_PAYLOAD: usize = 8192;
@@ -129,13 +129,11 @@ impl Handler for EchoHandler {
 }
 
 async fn server_main(path: PathBuf) {
-	let _node = BoundNode::bind(
-		&path,
-		EchoHandler {
-			cached: Mutex::new(None),
-		},
-	)
-	.expect("server: bind failed");
+	let (_node, node_ref) = Node::new(EchoHandler {
+		cached: Mutex::new(None),
+	})
+	.expect("server: node creation failed");
+	let _ref_binding = RefFsBinding::new(node_ref, &path).expect("server: bind failed");
 	// the parent drives everything and kills us when it's done
 	std::future::pending::<()>().await;
 }
