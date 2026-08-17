@@ -8,9 +8,10 @@ use crate::{
 };
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::{
+	fs::File,
 	mem::MaybeUninit,
 	os::fd::{AsFd, BorrowedFd, OwnedFd},
-	path::Path,
+	path::{Path, PathBuf},
 	sync::{Arc, LazyLock, OnceLock, Weak},
 };
 use tokio_util::task::AbortOnDrop;
@@ -134,12 +135,18 @@ impl Drop for RefInner {
 	}
 }
 /// Binding a Ref to the file system
-/// this does not handle lock files or file cleanup
+/// this handles lock files and fs cleanup
 pub struct RefFsBinding {
+	_lock_file: File,
+	path: PathBuf,
 	_task: AbortOnDrop,
 }
 impl RefFsBinding {
 	pub fn new(node_ref: Ref, path: impl AsRef<Path>) -> std::io::Result<Self> {
+		let _lock_file = Self::acquire_lock(path.as_ref()).ok_or_else(|| {
+			std::io::Error::new(std::io::ErrorKind::AddrInUse, "unable to acquire lock file")
+		})?;
+		_ = std::fs::remove_file(path.as_ref());
 		let accept_fd = Reactive::new(wire::bind(path.as_ref())?)?;
 		let _task = AbortOnDrop::new(
 			tokio::spawn(async move {
@@ -151,7 +158,31 @@ impl RefFsBinding {
 			})
 			.abort_handle(),
 		);
-		Ok(Self { _task })
+		Ok(Self {
+			_task,
+			_lock_file,
+			path: path.as_ref().to_path_buf(),
+		})
+	}
+
+	fn lock_path(dir: &Path) -> PathBuf {
+		let mut lock = dir.as_os_str().to_owned();
+		lock.push(".lock");
+		lock.into()
+	}
+
+	/// try to acquire lock file for path
+	fn acquire_lock(path: &Path) -> Option<File> {
+		let lock = Self::lock_path(path);
+		let file = File::create(&lock).ok()?;
+		file.try_lock().ok()?;
+		Some(file)
+	}
+}
+impl Drop for RefFsBinding {
+	fn drop(&mut self) {
+		_ = std::fs::remove_file(Self::lock_path(&self.path));
+		_ = std::fs::remove_file(&self.path);
 	}
 }
 
@@ -173,7 +204,7 @@ impl Ref {
 		// `connect` on an AF_UNIX socket completes without blocking unless the listener's
 		// backlog is full, in which case it reports `WouldBlock` and the caller retries —
 		// the connection is not queued, so there is nothing to wait on
-        // TODO: retry this with a wait?
+		// TODO: retry this with a wait?
 		let fd = wire::connect(path.as_ref()).and_then(Reactive::new)?;
 		let mut ancillary = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
 		let fd = fd

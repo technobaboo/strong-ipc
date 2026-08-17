@@ -198,7 +198,7 @@ impl<H: Handler> std::fmt::Debug for Node<H> {
 /// reported and dropped rather than delivered as a silently shortened payload
 async fn recv_loop<H: Handler>(handler: Arc<H>, socket: Reactive) -> std::io::Result<()> {
 	let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
-	let mut control = [MaybeUninit::uninit(); MAX_ANCILLARY_BUFFER_SIZE];
+	let mut control = vec![MaybeUninit::uninit(); MAX_ANCILLARY_BUFFER_SIZE];
 
 	loop {
 		let received = socket.recv(&mut buf, &mut control).await?;
