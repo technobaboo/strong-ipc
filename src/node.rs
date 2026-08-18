@@ -9,9 +9,7 @@ use crate::{
 };
 use rustix::net::UCred;
 use std::{
-	mem::MaybeUninit,
-	os::fd::AsFd,
-	sync::Arc,
+	mem::MaybeUninit, ops::Deref, os::fd::AsFd, sync::Arc
 };
 use tokio_util::task::AbortOnDrop;
 
@@ -180,6 +178,13 @@ impl<H: Handler> std::fmt::Debug for Node<H> {
 			.field("dead", &self.is_dead())
 			.finish_non_exhaustive()
 	}
+}
+impl<H: Handler> Deref for Node<H> {
+    type Target = Arc<H>;
+
+    fn deref(&self) -> &Self::Target {
+        self.handler()
+    }
 }
 
 /// the one spot where a message on the wire becomes a handler call
