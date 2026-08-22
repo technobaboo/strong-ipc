@@ -152,6 +152,7 @@ impl Drop for RefInner {
 }
 /// Binding a Ref to the file system
 /// this handles lock files and fs cleanup
+#[derive(Debug)]
 pub struct RefFsBinding {
 	_lock_file: File,
 	path: PathBuf,
@@ -180,6 +181,9 @@ impl RefFsBinding {
 			path: path.as_ref().to_path_buf(),
 		})
 	}
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
 	fn lock_path(dir: &Path) -> PathBuf {
 		let mut lock = dir.as_os_str().to_owned();
