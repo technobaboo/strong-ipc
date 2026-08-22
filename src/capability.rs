@@ -117,6 +117,22 @@ impl RefInner {
 	}
 }
 
+/// the socket this capability sends on
+///
+/// exposed for the things only the descriptor can answer — `fstat` for the socket's inode,
+/// which is what lets a holder look its own socket up in `/proc/net/unix` and ask how many
+/// descriptors across the system name it. That count is the nearest thing to a weak
+/// reference this layer has: a `Ref` you keep pins the node open, so "is anyone *else*
+/// holding this?" is a question the kernel answers and `is_dead` cannot.
+///
+/// borrowing it is all that is on offer. Sending on it, or closing it, behind the `Ref`'s
+/// back is not something this can stop and not something it condones.
+impl AsFd for Ref {
+	fn as_fd(&self) -> BorrowedFd<'_> {
+		self.borrowed_fd()
+	}
+}
+
 impl Drop for RefInner {
 	fn drop(&mut self) {
 		let Some(id) = self.id else { return };
